@@ -4,6 +4,7 @@ use eget::scope::Scope;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::symlink;
 use std::thread;
 
 fn server(body: &'static [u8], requests: usize) -> (String, thread::JoinHandle<Vec<String>>) {
@@ -91,6 +92,33 @@ fn direct_package_round_trip_uses_new_schema_and_managed_symlink() {
     );
     assert!(fs::symlink_metadata(scope.bin_dir.join("tool")).is_err());
     assert!(database.packages().unwrap().is_empty());
+}
+
+#[test]
+fn direct_package_install_handles_symlinked_scope_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("scope");
+    symlink(temp.path(), &alias).unwrap();
+    let scope = Scope::from_paths(
+        alias.join("packages"),
+        alias.join("state"),
+        alias.join("bin"),
+    );
+    let installer = Installer::new(scope.clone()).unwrap();
+    let (url, server) = server(b"#!/bin/sh\necho installed\n", 2);
+
+    assert_eq!(
+        installer
+            .install_many(&[url], &InstallOptions::default())
+            .unwrap(),
+        0
+    );
+    server.join().unwrap();
+    assert_eq!(
+        fs::read_to_string(scope.bin_dir.join("tool")).unwrap(),
+        "#!/bin/sh\necho installed\n"
+    );
 }
 
 #[test]

@@ -775,7 +775,7 @@ fn prepare_candidate(
     }
     progress.finish_and_clear();
     archive::extract(&payload, &candidate.name, &package.app, &tree)?;
-    let root = compat::descend_single_root(tree)?;
+    let root = compat::descend_single_root(tree)?.canonicalize()?;
     let has_modes = matches!(
         archive::format(&candidate.name),
         Format::SevenZ
