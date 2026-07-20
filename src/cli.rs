@@ -78,12 +78,16 @@ enum Command {
             .args(["pin", "unpin", "channel"])
     ))]
     Mark {
+        /// Mark the installed package as pinned
         #[arg(long, conflicts_with = "unpin")]
         pin: bool,
+        /// Mark the installed package as tracking
         #[arg(long, alias = "no-pin")]
         unpin: bool,
+        /// Release channel to track
         #[arg(long, value_name = "stable|prerelease")]
         channel: Option<Channel>,
+        /// Package ID whose tracking policy should change
         #[arg(required = true, value_name = "PACKAGE_ID")]
         package_id: Vec<String>,
     },
