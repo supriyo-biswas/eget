@@ -8,12 +8,13 @@ tools for updates.
 
 ## Install eget
 
-You can also manually download `eget` like so:
+You can manually download `eget` like so:
 
 ```sh
 curl -sSLfo eget \
   https://github.com/supriyo-biswas/eget/releases/latest/download/-$(uname -sm | tr 'A-Z ' 'a-z-')"
 
+chmod +x eget
 mv eget ~/.local/bin # or any other location on your PATH
 ```
 
@@ -28,8 +29,8 @@ eget BurntSushi/ripgrep eza-community/eza
 eget install BurntSushi/ripgrep eza-community/eza
 ```
 
-You can also download a specific tag, which will download and pin the version,
-preventing any updates from being downloaded for that tool.
+Specify a tag to download and pin a specific version, preventing any updates
+from being downloaded for that tool.
 
 ```sh
 eget install anomalyco/opencode:v1.18.3
@@ -51,9 +52,8 @@ You can also pass URLs to other forges such as Gitlab and Gitea:
 eget gitlab.com/gitlab-org/ci-cd/docker-machine
 ```
 
-You can also download tools hosted outside one of these forges. Simply pass in
-an URL to a binary on an archive:
-
+Tools hosted outside of these URLs are also supported. Simply pass in an URL
+to a binary on an archive:
 
 ```sh
 eget https://dl.min.io/aistor/mc/release/linux-amd64/mc
@@ -66,6 +66,9 @@ track version updates. For example:
 ```sh
 eget install --version-url https://dl.k8s.io/release/stable.txt \
   "https://dl.k8s.io/release/{{version}}/bin/linux/amd64/kubectl"
+
+eget install --version-url "https://go.dev/VERSION?m=text" \
+  "https://go.dev/dl/{{version}}.linux-amd64.tar.gz"
 ```
 
 ## See what is installed
@@ -171,6 +174,7 @@ regular users, however, root users have `system` scope by default where the
 binaries are installed in `/usr/local/bin` and the package contents are stored
 in `/opt/eget`, so that they can be consumed by every user.
 
-When operating as the root user, you may want to install a package in the
-system by using `eget --scope=user ...` (or `EGET_SCOPE=user`), which will
-install the binary only for the root user.
+When operating as the root user, you may want to install a package for use by
+the root user only, using `eget --scope=user ...` (or `EGET_SCOPE=user`),
+which will put the binaries in `/root/.local/bin` and the package contents in
+`/root/.local/share/eget`.
