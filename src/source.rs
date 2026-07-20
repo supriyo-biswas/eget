@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use regex::Regex;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LINK, LOCATION,
@@ -19,6 +20,7 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -28,6 +30,11 @@ const MAX_REDIRECTS: usize = 10;
 const RELEASE_PAGE_SIZE: usize = 100;
 const MAX_RELEASE_PAGES: usize = 5;
 const PROBE_CACHE_SECONDS: i64 = 12 * 60 * 60;
+
+static DIRECT_URL_VERSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[^0-9][0-9]+\.[0-9]+\.[0-9]+(?:$|[./_-])")
+        .expect("direct URL version regex is valid")
+});
 
 pub use crate::model::SourceKind;
 
@@ -1795,35 +1802,7 @@ fn direct_app(url: &Url) -> String {
 }
 
 fn direct_url_has_version(url: &Url) -> bool {
-    let path = url.path().as_bytes();
-    for start in 0..path.len() {
-        if !path[start].is_ascii_digit() || start > 0 && path[start - 1].is_ascii_digit() {
-            continue;
-        }
-
-        let mut end = start;
-        for component in 0..3 {
-            let digits = end;
-            while end < path.len() && path[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end == digits {
-                break;
-            }
-            if component < 2 {
-                if path.get(end) != Some(&b'.') {
-                    break;
-                }
-                end += 1;
-            } else if path
-                .get(end)
-                .is_none_or(|byte| matches!(byte, b'.' | b'-' | b'_' | b'/'))
-            {
-                return true;
-            }
-        }
-    }
-    false
+    DIRECT_URL_VERSION.is_match(url.path())
 }
 
 const PLATFORM_NAME_MARKERS: &[&str] = &[
