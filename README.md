@@ -58,6 +58,7 @@ to a binary on an archive:
 ```sh
 eget https://dl.min.io/aistor/mc/release/linux-amd64/mc
 eget https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+eget https://cache.agilebits.com/dist/1P/op2/pkg/v2.35.0/op_linux_amd64_v2.35.0.zip
 ```
 
 For projects that produce versioned binaries only, you can specify an URL to
