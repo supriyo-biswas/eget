@@ -1,0 +1,116 @@
+name: Test, build, and release
+
+on:
+  push: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+
+  build-linux-x86_64:
+    name: Build Linux x86_64
+    needs: tests
+    runs-on: ubuntu-24.04
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Verify and package
+        run: |
+          set -euo pipefail
+          binary=target/x86_64-unknown-linux-musl/release/eget
+          file "$binary" | tee /dev/stderr | grep -Eq "statically linked|static-pie linked"
+          dependencies="$(readelf -dW "$binary" | awk '$2 == "(NEEDED)"')"
+          test -z "$dependencies" || { echo "dynamic dependencies: $dependencies" >&2; exit 1; }
+          cp "$binary" eget-linux-x86_64
+          tar -C "$(dirname "$binary")" -czf eget-linux-x86_64.tar.gz eget
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eget-linux-x86_64
+          path: eget-linux-x86_64*
+
+  build-linux-aarch64:
+    name: Build Linux aarch64
+    needs: tests
+    runs-on: ubuntu-24.04-arm
+    env:
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target aarch64-unknown-linux-musl
+      - name: Verify and package
+        run: |
+          set -euo pipefail
+          binary=target/aarch64-unknown-linux-musl/release/eget
+          file "$binary" | tee /dev/stderr | grep -Eq "statically linked|static-pie linked"
+          dependencies="$(readelf -dW "$binary" | awk '$2 == "(NEEDED)"')"
+          test -z "$dependencies" || { echo "dynamic dependencies: $dependencies" >&2; exit 1; }
+          cp "$binary" eget-linux-aarch64
+          tar -C "$(dirname "$binary")" -czf eget-linux-aarch64.tar.gz eget
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eget-linux-aarch64
+          path: eget-linux-aarch64*
+
+  build-darwin-arm64:
+    name: Build macOS arm64
+    needs: tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - run: cargo build --release --target aarch64-apple-darwin
+      - name: Verify and package
+        run: |
+          set -euo pipefail
+          binary=target/aarch64-apple-darwin/release/eget
+          invalid="$(otool -L "$binary" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/usr/lib/|/System/Library/)' || true)"
+          test -z "$invalid" || { echo "non-system dependencies: $invalid" >&2; exit 1; }
+          cp "$binary" eget-darwin-arm64
+          tar -C "$(dirname "$binary")" -czf eget-darwin-arm64.tar.gz eget
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eget-darwin-arm64
+          path: eget-darwin-arm64*
+
+  release:
+    name: Publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [build-linux-x86_64, build-linux-aarch64, build-darwin-arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
