@@ -13,6 +13,8 @@ use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::symlink;
@@ -668,6 +670,17 @@ struct Prepared {
     validators: HttpValidators,
 }
 
+#[derive(Debug)]
+struct NoCompatibleExecutable;
+
+impl fmt::Display for NoCompatibleExecutable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("asset has no host-compatible executable")
+    }
+}
+
+impl Error for NoCompatibleExecutable {}
+
 impl Prepared {
     fn binary_names(&self) -> Vec<String> {
         self.binaries
@@ -730,13 +743,33 @@ fn prepare(client: &Client, scope: &Scope, package: &ResolvedPackage) -> Result<
                     validators,
                 });
             }
-            Err(error) => failures.push(format!("{}: {error:#}", candidate.name)),
+            Err(error) => failures.push((candidate.name.clone(), error)),
         }
     }
-    bail!(
-        "no release asset contained a compatible executable\n{}",
-        failures.join("\n")
-    )
+    Err(preparation_failure(failures))
+}
+
+fn preparation_failure(mut failures: Vec<(String, anyhow::Error)>) -> anyhow::Error {
+    if failures.len() == 1 && !failures[0].1.is::<NoCompatibleExecutable>() {
+        let (name, error) = failures.pop().expect("one candidate failure");
+        return error.context(name);
+    }
+
+    let compatibility_only = !failures.is_empty()
+        && failures
+            .iter()
+            .all(|(_, error)| error.is::<NoCompatibleExecutable>());
+    let summary = if compatibility_only {
+        "no release asset contained a compatible executable"
+    } else {
+        "failed to prepare any release asset"
+    };
+    let details = failures
+        .iter()
+        .map(|(name, error)| format!("{name}: {error:#}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::anyhow!("{summary}\n{details}")
 }
 
 fn prepare_candidate(
@@ -788,7 +821,7 @@ fn prepare_candidate(
     );
     let mut binaries = compat::executable_candidates(&root, has_modes, host)?;
     if binaries.is_empty() {
-        bail!("asset has no host-compatible executable")
+        return Err(NoCompatibleExecutable.into());
     }
     if binaries.len() == 1 && platform_suffixed(&binaries[0], host.os) {
         let renamed = binaries[0].with_file_name(&package.app);
@@ -1029,6 +1062,52 @@ fn acquire_lock(lock: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_non_compatibility_failure_is_returned_without_a_misleading_summary() {
+        let error = preparation_failure(vec![(
+            "tool-linux.zip".into(),
+            anyhow::anyhow!("network unavailable"),
+        )]);
+
+        assert_eq!(format!("{error:#}"), "tool-linux.zip: network unavailable");
+        assert!(!error.to_string().contains("compatible executable"));
+    }
+
+    #[test]
+    fn compatibility_summary_is_reserved_for_compatibility_failures() {
+        let error = preparation_failure(vec![
+            ("tool-glibc.zip".into(), NoCompatibleExecutable.into()),
+            ("tool-musl.zip".into(), NoCompatibleExecutable.into()),
+        ]);
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("no release asset contained a compatible executable")
+        );
+        assert!(format!("{error:#}").contains("tool-glibc.zip"));
+        assert!(format!("{error:#}").contains("tool-musl.zip"));
+    }
+
+    #[test]
+    fn mixed_candidate_failures_use_a_neutral_summary() {
+        let error = preparation_failure(vec![
+            ("tool-glibc.zip".into(), NoCompatibleExecutable.into()),
+            (
+                "tool-musl.zip".into(),
+                anyhow::anyhow!("connection reset by peer"),
+            ),
+        ]);
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("failed to prepare any release asset")
+        );
+        assert!(format!("{error:#}").contains("tool-glibc.zip"));
+        assert!(format!("{error:#}").contains("tool-musl.zip: connection reset by peer"));
+    }
 
     #[test]
     fn list_format_uses_nullable_version() {
