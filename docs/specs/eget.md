@@ -19,7 +19,7 @@ At a high level, installation involves:
 
 All commands require a package ID except for `install`, which can work with a URL (e.g. `http://example.com/foo/bar/baz.tgz`), a package ID, or an application ID. These terms are defined in [Package/application IDs](#packageapplication-ids).
 
-The `install` subcommand may be omitted, so `eget my/pkg` means `eget install my/pkg`. The command aliases are `install`/`inst`/`i`, `list`/`ls`, and `uninstall`/`remove`/`rm`. Argument normalization recognizes every alias before deciding whether to insert the implicit `install` command.
+The `install` subcommand may be omitted, so `eget my/pkg` means `eget install my/pkg`. The command aliases are `install`/`inst`/`i`, `list`/`ls`, and `uninstall`/`remove`/`rm`. After any leading global `--scope` option, argument normalization inserts the implicit `install` command only when the command-position argument contains `/`, as every valid install locref does. Consequently, install-specific options follow the locref in the implicit form (for example, `eget my/pkg --force`); use the explicit form (`eget install --force my/pkg`) to place them first. Slashless values are left for command parsing, so a typo such as `eget in` fails immediately as an unknown subcommand rather than being treated as a URL to install.
 
 Commands that accept multiple packages process every operand even if an earlier operand fails. They report each failure and return a non-zero status if any operand failed.
 

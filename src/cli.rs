@@ -184,26 +184,9 @@ fn normalize(mut arguments: Vec<OsString>) -> Vec<OsString> {
             index += 1;
             continue;
         }
-        if matches!(value.as_ref(), "--help" | "-h" | "--version" | "-V") {
-            return arguments;
+        if value.contains('/') {
+            arguments.insert(index, "install".into());
         }
-        if matches!(
-            value.as_ref(),
-            "install"
-                | "inst"
-                | "i"
-                | "list"
-                | "ls"
-                | "mark"
-                | "update"
-                | "uninstall"
-                | "remove"
-                | "rm"
-                | "help"
-        ) {
-            return arguments;
-        }
-        arguments.insert(index, "install".into());
         return arguments;
     }
     arguments
@@ -279,6 +262,20 @@ mod tests {
             "owner/repo".into(),
         ]);
         assert_eq!(arguments[3], "install");
+    }
+
+    #[test]
+    fn slashless_unknown_command_is_not_rewritten_as_an_install() {
+        let arguments = normalize(vec!["eget".into(), "in".into()]);
+        assert_eq!(arguments, ["eget", "in"]);
+        assert!(Cli::try_parse_from(arguments).is_err());
+    }
+
+    #[test]
+    fn implicit_install_accepts_options_after_the_location() {
+        let arguments = normalize(vec!["eget".into(), "owner/repo".into(), "--force".into()]);
+        assert_eq!(arguments[1], "install");
+        assert!(Cli::try_parse_from(arguments).is_ok());
     }
 
     #[test]
