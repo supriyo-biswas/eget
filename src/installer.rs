@@ -296,7 +296,7 @@ impl Session<'_> {
                 options.pin,
                 installed.as_ref().map(|package| package.pinned),
                 options.reinstall,
-                resolved.automatic_pin,
+                resolved.automatic_pin && version_check_url.is_none(),
             ),
             resolved.kind,
             version_check_url.as_deref(),

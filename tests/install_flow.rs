@@ -147,11 +147,71 @@ fn direct_package_with_an_etag_tracks_updates() {
 }
 
 #[test]
+fn versioned_direct_package_with_an_etag_is_automatically_pinned() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = scope(&temp);
+    let installer = Installer::new(scope.clone()).unwrap();
+    let (url, server) = server_with_headers(b"#!/bin/sh\nexit 0\n", b"ETag: asset-one\r\n", 2);
+    let url = url.replace("/tool", "/tool-v1.2.3");
+
+    assert_eq!(
+        installer
+            .install_many(std::slice::from_ref(&url), &InstallOptions::default())
+            .unwrap(),
+        0
+    );
+    server.join().unwrap();
+
+    let package = Database::open(&scope.database, &scope.package_root)
+        .unwrap()
+        .packages()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(package.pinned);
+    assert_eq!(package.current_version, None);
+    assert_eq!(package.validators.etag.as_deref(), Some("asset-one"));
+}
+
+#[test]
+fn install_time_unpin_overrides_a_versioned_url_when_an_etag_exists() {
+    let temp = tempfile::tempdir().unwrap();
+    let scope = scope(&temp);
+    let installer = Installer::new(scope.clone()).unwrap();
+    let (url, server) = server_with_headers(b"#!/bin/sh\nexit 0\n", b"ETag: asset-one\r\n", 2);
+    let url = url.replace("/tool", "/tool-v1.2.3");
+
+    assert_eq!(
+        installer
+            .install_many(
+                &[url],
+                &InstallOptions {
+                    pin: Some(false),
+                    ..InstallOptions::default()
+                }
+            )
+            .unwrap(),
+        0
+    );
+    server.join().unwrap();
+
+    let package = Database::open(&scope.database, &scope.package_root)
+        .unwrap()
+        .packages()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(!package.pinned);
+    assert_eq!(package.current_version, None);
+}
+
+#[test]
 fn direct_package_without_validators_ignores_install_time_unpin() {
     let temp = tempfile::tempdir().unwrap();
     let scope = scope(&temp);
     let installer = Installer::new(scope.clone()).unwrap();
     let (url, server) = server(b"#!/bin/sh\nexit 0\n", 2);
+    let url = url.replace("/tool", "/tool-v1.2.3");
 
     assert_eq!(
         installer
@@ -363,10 +423,10 @@ fn version_url_persists_nullable_schema_tracking_fields() {
                 "/version" => (
                     "200 OK",
                     b"Content-Type: application/json; charset=utf-8\r\n",
-                    br#"{"version":"v1"}"#,
+                    br#"{"version":"v1.2.3"}"#,
                 ),
                 "/api/v1/version" => ("404 Not Found", b"", b""),
-                "/tool-v1" => ("200 OK", b"ETag: asset-one\r\n", b"#!/bin/sh\nexit 0\n"),
+                "/tool-v1.2.3" => ("200 OK", b"ETag: asset-one\r\n", b"#!/bin/sh\nexit 0\n"),
                 _ => panic!("unexpected path {path}"),
             };
             write!(
@@ -397,7 +457,7 @@ fn version_url_persists_nullable_schema_tracking_fields() {
     );
     assert_eq!(
         handle.join().unwrap(),
-        ["/version", "/api/v1/version", "/tool-v1"]
+        ["/version", "/api/v1/version", "/tool-v1.2.3"]
     );
 
     let package = Database::open(&scope.database, &scope.package_root)
@@ -406,7 +466,7 @@ fn version_url_persists_nullable_schema_tracking_fields() {
         .unwrap()
         .pop()
         .unwrap();
-    assert_eq!(package.current_version.as_deref(), Some("v1"));
+    assert_eq!(package.current_version.as_deref(), Some("v1.2.3"));
     assert_eq!(package.installed_asset_url, template);
     assert_eq!(
         package.version_check_url.as_deref(),

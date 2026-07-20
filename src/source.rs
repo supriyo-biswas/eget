@@ -245,7 +245,7 @@ pub fn resolve_with_preferences(
     if let Some(port) = url.port() {
         owner.push_str(&format!(":{port}"));
     }
-    let pinned = false;
+    let pinned = direct_url_has_version(&url);
     let name = url_asset_name(&url, &app);
     Ok(ResolvedPackage {
         id: format!("{owner}/{app}"),
@@ -1767,6 +1767,7 @@ fn normalized_owner(host: &str) -> String {
             | "download"
             | "downloads"
             | "dl"
+            | "cache"
             | "cdn"
             | "release"
             | "releases"
@@ -1791,6 +1792,38 @@ fn direct_app(url: &Url) -> String {
         .last()
         .and_then(|segment| normalized_app_segment(segment))
         .unwrap_or_else(|| "default".to_owned())
+}
+
+fn direct_url_has_version(url: &Url) -> bool {
+    let path = url.path().as_bytes();
+    for start in 0..path.len() {
+        if !path[start].is_ascii_digit() || start > 0 && path[start - 1].is_ascii_digit() {
+            continue;
+        }
+
+        let mut end = start;
+        for component in 0..3 {
+            let digits = end;
+            while end < path.len() && path[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end == digits {
+                break;
+            }
+            if component < 2 {
+                if path.get(end) != Some(&b'.') {
+                    break;
+                }
+                end += 1;
+            } else if path
+                .get(end)
+                .is_none_or(|byte| matches!(byte, b'.' | b'-' | b'_' | b'/'))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 const PLATFORM_NAME_MARKERS: &[&str] = &[
@@ -2293,6 +2326,48 @@ mod tests {
         assert_eq!(format!("{owner}/{app}"), "example.com/tool");
         assert!(!redact(&url).contains("secret"));
         assert!(!redact(&url).contains("key"));
+    }
+
+    #[test]
+    fn direct_url_versions_are_detected_only_in_the_path_at_boundaries() {
+        for input in [
+            "https://go.dev/dl/go1.25.0.linux-amd64.tar.gz",
+            "https://cache.agilebits.com/dist/1P/op2/pkg/v2.35.0/op_linux_amd64_v2.35.0.zip",
+            "https://example.com/tool-1.2.3-linux",
+            "https://example.com/versions/1.2.3/tool",
+            "https://example.com/tool_1.2.3",
+        ] {
+            assert!(
+                direct_url_has_version(&normalized_url(input).unwrap()),
+                "{input}"
+            );
+        }
+
+        for input in [
+            "https://1.2.3.4/tool",
+            "https://example.com/tool?version=1.2.3",
+            "https://example.com/tool-1.2",
+            "https://example.com/tool-1.2.3beta",
+        ] {
+            assert!(
+                !direct_url_has_version(&normalized_url(input).unwrap()),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn versioned_direct_urls_request_automatic_pinning() {
+        let package = resolve_with_preferences(
+            &client().unwrap(),
+            "https://example.com/tool-v1.2.3",
+            Some(SourceKind::Direct),
+            Channel::Stable,
+            None,
+        )
+        .unwrap();
+        assert!(package.automatic_pin);
+        assert!(package.pinned);
     }
 
     #[test]
