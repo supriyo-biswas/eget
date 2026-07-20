@@ -12,7 +12,7 @@ You can manually download `eget` like so:
 
 ```sh
 curl -sSLfo eget \
-  https://github.com/supriyo-biswas/eget/releases/latest/download/-$(uname -sm | tr 'A-Z ' 'a-z-')"
+  "https://github.com/supriyo-biswas/eget/releases/latest/download/eget-$(uname -sm | tr 'A-Z ' 'a-z-')"
 
 chmod +x eget
 mv eget ~/.local/bin # or any other location on your PATH
