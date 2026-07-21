@@ -163,17 +163,21 @@ For example, `EGET_DOWNLOADS_EXAMPLE_ORG_TOKEN="Bearer your-token"` is sent
 verbatim when accessing `downloads.example.org`, including `--version-url`
 checks.
 
-## Scopes
+## Using as a system level package manager
 
 `eget` keeps installations separate by scope. `user` scope is the default for
-regular users, however, root users have `system` scope by default where the
-binaries are installed in `/usr/local/bin` and the package contents are stored
-in `/opt/eget`, so that they can be consumed by every user.
+regular users, however, root users have `system` scope by default. In `system`
+scope, the binaries are installed in `/usr/local/bin` and the package
+contents are stored in `/opt/eget`, so that they can be consumed by every
+user.
 
-When operating as the root user, you may want to install a package for use by
-the root user only, using `eget --scope=user ...` (or `EGET_SCOPE=user`),
-which will put the binaries in `/root/.local/bin` and the package contents in
-`/root/.local/share/eget`.
+This allows using `eget` as a system level package manager, simply by calling
+`sudo eget`.
+
+In rare cases, when operating as the root user, you may want to install a
+package for use by the root user only. In these cases, use
+`eget --scope=user ...` (or `EGET_SCOPE=user`), which will put the binaries in
+`/root/.local/bin` and the package contents in `/root/.local/share/eget`.
 
 ## More information
 
