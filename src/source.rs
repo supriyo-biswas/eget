@@ -1642,6 +1642,7 @@ fn supported_asset(name: &str, tag: &str, platform: Platform) -> bool {
     }
     (!tag.is_empty() && name.ends_with(&tag))
         || ARCHIVE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+        || terminal_platform_pair(&name, platform)
         || platform_suffixes(platform)
             .iter()
             .any(|suffix| name.ends_with(suffix))
@@ -1753,6 +1754,31 @@ fn platform_suffixes(platform: Platform) -> Vec<String> {
         .iter()
         .map(|marker| format!(".{marker}"))
         .collect()
+}
+
+fn terminal_platform_pair(name: &str, platform: Platform) -> bool {
+    os_markers(platform.os()).iter().any(|os| {
+        arch_markers(platform).iter().any(|arch| {
+            terminal_marker_pair(name, os, arch) || terminal_marker_pair(name, arch, os)
+        })
+    })
+}
+
+fn terminal_marker_pair(name: &str, first: &str, second: &str) -> bool {
+    let Some(before_second) = name.strip_suffix(second) else {
+        return false;
+    };
+    let before_separator = before_second.trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+    if before_separator.len() == before_second.len() {
+        return false;
+    }
+    let Some(before_first) = before_separator.strip_suffix(first) else {
+        return false;
+    };
+    before_first
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_ascii_alphanumeric())
 }
 
 fn marker_match(name: &str, marker: &str) -> bool {
@@ -1921,6 +1947,15 @@ mod tests {
             ("macos", _) => "tool-darwin-amd64",
             (_, "aarch64") => "tool-linux-arm64",
             _ => "tool-linux-amd64",
+        }
+    }
+
+    fn dotted_platform_asset_name() -> &'static str {
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => "direnv.darwin-arm64",
+            ("macos", _) => "direnv.darwin-amd64",
+            (_, "aarch64") => "direnv.linux-arm64",
+            _ => "direnv.linux-amd64",
         }
     }
 
@@ -2392,6 +2427,60 @@ mod tests {
         assert!(supported_asset("tool-linux-amd64", "v1", platform));
         assert!(!supported_asset("tool-windows-amd64.zip", "v1", platform));
         assert!(!supported_asset("checksums-linux-amd64", "v1", platform));
+    }
+
+    #[test]
+    fn raw_assets_accept_terminal_platform_pairs_in_either_order() {
+        let linux = Platform::Linux {
+            arch: HostArch::X86_64,
+            libc: Some(Libc::Glibc),
+        };
+        for name in [
+            "direnv.linux-amd64",
+            "tool.linux.x64",
+            "tool.linux.x86_64",
+            "tool.linux_amd64",
+            "tool.amd64_linux",
+        ] {
+            assert!(supported_asset(name, "v1", linux), "rejected {name}");
+        }
+        assert!(supported_asset("tool.linux64", "v1", linux));
+        assert!(!supported_asset("tool.notlinux-amd64", "v1", linux));
+        assert!(!supported_asset("tool.darwin-amd64", "v1", linux));
+        assert!(!supported_asset("tool.linux-arm64", "v1", linux));
+        assert!(!supported_asset("direnv.linux-amd64.txt", "v1", linux));
+
+        let macos = Platform::Macos {
+            arch: HostArch::Aarch64,
+        };
+        assert!(supported_asset("tool.darwin-arm64", "v1", macos));
+        assert!(supported_asset("tool.arm64_darwin", "v1", macos));
+    }
+
+    #[test]
+    fn github_release_keeps_a_terminal_platform_pair_asset() {
+        let asset = dotted_platform_asset_name();
+        let (base, handle) = serve(vec![MockResponse {
+            status: "200 OK",
+            headers: vec![],
+            body: format!(
+                r#"{{"tag_name":"v2.37.1","assets":[{{"name":"{asset}","browser_download_url":"https://example.com/{asset}"}}]}}"#
+            ),
+        }]);
+        let package = resolve_github_at(
+            &client().unwrap(),
+            &Url::parse("https://github.com/").unwrap(),
+            &Url::parse(&format!("{base}/")).unwrap(),
+            &["direnv".into(), "direnv".into()],
+            ReleaseRequest::Latest,
+            "github.com/direnv/direnv",
+            Channel::Stable,
+        )
+        .unwrap();
+
+        assert_eq!(package.tag.as_deref(), Some("v2.37.1"));
+        assert_eq!(package.candidates[0].name, asset);
+        assert!(handle.join().unwrap()[0].contains("/repos/direnv/direnv/releases/latest"));
     }
 
     #[test]
