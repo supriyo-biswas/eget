@@ -1,8 +1,19 @@
 name: Test, build, and release
 
 on:
-  push: {}
+  pull_request:
+    paths:
+      - '.github/workflows/build.yml'
+      - '**/*.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
   workflow_dispatch: {}
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+      - '**/*.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 
 permissions:
   contents: write

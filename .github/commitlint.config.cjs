@@ -4,7 +4,7 @@ module.exports = {
     {
       rules: {
         "body-required-unless-chore": ({ body, type }) => [
-          (type === "chore" || type === "docs" || type === "fix") || Boolean(body),
+          (type === "chore" || type === "docs" || type == "doc" || type === "fix") || Boolean(body),
           "commit body must not be empty unless the commit type is chore or docs",
         ],
       },
@@ -12,5 +12,6 @@ module.exports = {
   ],
   rules: {
     "body-required-unless-chore": [2, "always"],
+    "body-max-line-length": [0]
   },
 };
