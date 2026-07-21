@@ -140,11 +140,6 @@ $ eget install kubernetes-sigs/kustomize
 Installed github.com/kubernetes-sigs/kustomize:kustomize
 ```
 
-## More information
-
-Run `eget --help` or `eget <command> --help` for the complete command-line
-reference.
-
 ## Authentication and private repositories
 
 To work with private repositories, set a token in your environment before
@@ -179,3 +174,8 @@ When operating as the root user, you may want to install a package for use by
 the root user only, using `eget --scope=user ...` (or `EGET_SCOPE=user`),
 which will put the binaries in `/root/.local/bin` and the package contents in
 `/root/.local/share/eget`.
+
+## More information
+
+Run `eget --help` or `eget <command> --help` for the complete command-line
+reference.
