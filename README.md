@@ -56,6 +56,7 @@ Tools hosted outside of these URLs are also supported. Simply pass in an URL
 to a binary on an archive:
 
 ```sh
+eget https://nodejs.org/dist/latest/node-v26.5.0-linux-x64.tar.xz
 eget https://dl.min.io/aistor/mc/release/linux-amd64/mc
 eget https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
 eget https://cache.agilebits.com/dist/1P/op2/pkg/v2.35.0/op_linux_amd64_v2.35.0.zip
