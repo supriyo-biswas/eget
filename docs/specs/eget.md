@@ -2,13 +2,14 @@ This is the specification for the `eget` CLI, a package manager that installs bi
 
 ## Overview
 
-`eget` has five operations, implemented as subcommands:
+`eget` has six operations, implemented as subcommands:
 
 * `install` - Install one or more packages
 * `list` - List installed packages
 * `update` - Update tracked packages
 * `uninstall` - Uninstall packages
 * `mark` - Change user-provided metadata of a package, such as pinning policy and preferred release channel.
+* `exec` - Execute a command installed in the active scope.
 
 At a high level, installation involves:
 1. Resolving whatever the user provided (a URL, package ID, or application ID) into a concrete package ID and a downloadable artifact.
@@ -17,13 +18,13 @@ At a high level, installation involves:
 4. Finding binaries in the package and symlinking them into a desired location.
 5. Storing metadata required to manage the installation (for later `list`, `update`, `uninstall`, `mark`).
 
-All commands require a package ID except for `install`, which can work with a URL (e.g. `http://example.com/foo/bar/baz.tgz`), a package ID, or an application ID. These terms are defined in [Package/application IDs](#packageapplication-ids).
+Package-selection commands require a package ID except for `install`, which can work with a URL (e.g. `http://example.com/foo/bar/baz.tgz`), a package ID, or an application ID. `exec` instead selects by an installed command name, with an optional exact package ID to resolve ambiguity. These terms are defined in [Package/application IDs](#packageapplication-ids).
 
-The `install` subcommand may be omitted, so `eget my/pkg` means `eget install my/pkg`. The command aliases are `install`/`inst`/`i`, `list`/`ls`, and `uninstall`/`remove`/`rm`. After any leading global `--scope` option, argument normalization inserts the implicit `install` command only when the command-position argument contains `/`, as every valid install locref does. Consequently, install-specific options follow the locref in the implicit form (for example, `eget my/pkg --force`); use the explicit form (`eget install --force my/pkg`) to place them first. Slashless values are left for command parsing, so a typo such as `eget in` fails immediately as an unknown subcommand rather than being treated as a URL to install.
+The `install` subcommand may be omitted, so `eget my/pkg` means `eget install my/pkg`. The command aliases are `install`/`inst`/`i`, `list`/`ls`, `uninstall`/`remove`/`rm`, and `exec`/`x`. After any leading global `--scope` option, argument normalization inserts the implicit `install` command only when the command-position argument contains `/`, as every valid install locref does. Consequently, install-specific options follow the locref in the implicit form (for example, `eget my/pkg --force`); use the explicit form (`eget install --force my/pkg`) to place them first. Slashless values are left for command parsing, so a typo such as `eget in` fails immediately as an unknown subcommand rather than being treated as a URL to install.
 
 Commands that accept multiple packages process every operand even if an earlier operand fails. They report each failure and return a non-zero status if any operand failed.
 
-Running any package management command acquires a lock so that no more than one instance of `eget` may mutate state at a given time (see [Locking](#locking)).
+Running any package management command acquires a lock so that no more than one instance of `eget` may mutate state at a given time (see [Locking](#locking)). `exec` releases that lock after resolving and validating the command and before replacing the process.
 
 ## Storage
 
@@ -63,7 +64,7 @@ At user scope, the default `$stateDir`/`$packageFilesDir` resolve under `$XDG_DA
 
 ## Locking
 
-Every package management command (`install`, `list`, `update`, `uninstall`, `mark`) acquires an exclusive lock on `{$lockDir}/eget.lock` for its entire duration before touching the metadata DB or the filesystem, and releases it on exit (including on error). This serializes all mutating operations across concurrently-invoked `eget` processes.
+Every package management command (`install`, `list`, `update`, `uninstall`, `mark`, `exec`) acquires an exclusive lock on `{$lockDir}/eget.lock` before touching the metadata DB or the filesystem. The first five commands hold it for their entire duration and release it on exit (including on error). `exec` holds it only while resolving and validating the executable, then closes the database and releases the lock before process replacement so a long-running command does not block package operations. A concurrent removal after this point may cause process replacement to fail cleanly.
 
 If the lock is already held, `eget` does not fail immediately. It prints a user-visible attempt counter and makes 10 attempts, waiting one second between attempts (at most nine seconds of deliberate waiting). If the lock still cannot be acquired on the 10th attempt, `eget` exits with an error.
 
@@ -444,3 +445,13 @@ The SQLite transaction and compensating filesystem restoration cover ordinary op
 github.com/BurntSushi/ripgrep	14.1.0	tracking	rg
 github.com/supriyo-biswas/static-builds:gnu-sed	4.1	pinned	sed
 ```
+
+### Exec
+
+`eget exec [-p|--package PACKAGE_ID] [--] COMMAND [ARG...]` (alias `eget x`) executes a command recorded in the active scope. Scope selection follows the normal `--scope`/`EGET_SCOPE`/default rules and does not search or combine other scopes. Arguments after `COMMAND` are passed through without further option parsing; `--` may be used before `COMMAND` when needed.
+
+Without `--package`, `eget` looks up `COMMAND` in the `binaries` table. No match is an error. One match selects that package. If multiple packages provide the same name, `eget` lists every owning package ID in deterministic order and asks the user to rerun `eget x -p <PACKAGE_ID> COMMAND`. With `--package`, the value must be an exact installed package ID and that package must record `COMMAND`; package-ID prefixes are not accepted.
+
+The executable is resolved from the selected package's stored `bin_dir`, never from the ambient `PATH`. The recorded command path must be a live symlink whose canonical target is an existing regular file strictly beneath the package's canonical `installation_dir`. Missing, broken, replaced, or out-of-package links are rejected. Because the exact original internal target is not stored, containment within the selected package is the strongest available integrity check.
+
+After resolution, `eget` releases its package lock and uses Unix process replacement rather than spawning a child. The command receives its requested name as `argv[0]` where the operating system permits, plus every supplied argument. It inherits the caller's current directory, environment, and standard streams without modifying `PATH`; its exit status and signal behavior therefore become those of the `eget` invocation.

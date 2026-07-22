@@ -6,7 +6,9 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 #[derive(Parser)]
 #[command(
@@ -106,6 +108,19 @@ enum Command {
         #[arg(required = true, value_name = "PACKAGE_ID")]
         package_id: Vec<String>,
     },
+    /// Execute an installed command
+    #[command(alias = "x", trailing_var_arg = true)]
+    Exec {
+        /// Exact package ID from which to execute the command
+        #[arg(short = 'p', long, value_name = "PACKAGE_ID")]
+        package: Option<String>,
+        /// Installed command name
+        #[arg(required = true, value_name = "COMMAND")]
+        command: String,
+        /// Arguments passed to the installed command
+        #[arg(value_name = "ARG", allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
 }
 
 pub fn run(args: Vec<OsString>) -> Result<u8> {
@@ -165,6 +180,18 @@ pub fn run(args: Vec<OsString>) -> Result<u8> {
             }
         }),
         Command::Uninstall { package_id } => installer.uninstall_many(&package_id),
+        Command::Exec {
+            package,
+            command,
+            args,
+        } => {
+            let executable = installer.executable(&command, package.as_deref())?;
+            let error = ProcessCommand::new(executable)
+                .arg0(&command)
+                .args(args)
+                .exec();
+            Err(error).with_context(|| format!("execute command {command:?}"))
+        }
     }
 }
 
@@ -308,5 +335,54 @@ mod tests {
         assert!(install.is_ok());
         let mark = Cli::try_parse_from(["eget", "mark", "--no-pin", "github.com/owner/repo"]);
         assert!(mark.is_ok());
+    }
+
+    #[test]
+    fn exec_alias_and_trailing_arguments_parse() {
+        let cli = Cli::try_parse_from([
+            "eget",
+            "x",
+            "--package=github.com/owner/repo",
+            "tool",
+            "--flag",
+            "value",
+        ])
+        .unwrap();
+        let Command::Exec {
+            package,
+            command,
+            args,
+        } = cli.command
+        else {
+            panic!("expected exec command")
+        };
+        assert_eq!(package.as_deref(), Some("github.com/owner/repo"));
+        assert_eq!(command, "tool");
+        assert_eq!(args, ["--flag", "value"]);
+    }
+
+    #[test]
+    fn exec_accepts_option_separator_and_short_package_option() {
+        let cli = Cli::try_parse_from([
+            "eget",
+            "exec",
+            "-p",
+            "github.com/owner/repo",
+            "--",
+            "tool",
+            "-p",
+        ])
+        .unwrap();
+        let Command::Exec {
+            package,
+            command,
+            args,
+        } = cli.command
+        else {
+            panic!("expected exec command")
+        };
+        assert_eq!(package.as_deref(), Some("github.com/owner/repo"));
+        assert_eq!(command, "tool");
+        assert_eq!(args, ["-p"]);
     }
 }

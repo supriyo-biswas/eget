@@ -126,6 +126,10 @@ impl Installer {
         })
     }
 
+    pub(crate) fn executable(&self, command: &str, package_id: Option<&str>) -> Result<PathBuf> {
+        self.session(|session| session.executable(command, package_id))
+    }
+
     pub fn update_many(
         &self,
         requested_ids: &[String],
@@ -211,6 +215,58 @@ enum PinNotice {
 }
 
 impl Session<'_> {
+    fn executable(&self, command: &str, package_id: Option<&str>) -> Result<PathBuf> {
+        let package = if let Some(id) = package_id {
+            let package = self
+                .database
+                .package(id)?
+                .with_context(|| format!("package ID not installed: {id}"))?;
+            if !package.binaries.iter().any(|binary| binary == command) {
+                bail!("package {id} does not provide command {command:?}")
+            }
+            package
+        } else {
+            let owners = self.database.owners_of_binary(command)?;
+            let id = match owners.as_slice() {
+                [] => bail!("command not installed in active scope: {command}"),
+                [id] => id,
+                _ => bail!(
+                    "command {command:?} is provided by multiple packages:\n{}\n\
+                     rerun with: eget x -p <PACKAGE_ID> {command}",
+                    owners.join("\n")
+                ),
+            };
+            self.database
+                .package(id)?
+                .with_context(|| format!("package ID not installed: {id}"))?
+        };
+
+        self.scope.validate_install_dir(&package.installation_dir)?;
+        let installation_dir = package.installation_dir.canonicalize().with_context(|| {
+            format!("resolve installation directory for package {}", package.id)
+        })?;
+        let link = package.bin_dir.join(command);
+        let metadata = fs::symlink_metadata(&link)
+            .with_context(|| format!("managed command link is unavailable: {}", link.display()))?;
+        if !metadata.file_type().is_symlink() {
+            bail!("managed command link is not a symlink: {}", link.display())
+        }
+        let target = link
+            .canonicalize()
+            .with_context(|| format!("managed command link is broken: {}", link.display()))?;
+        if target == installation_dir || !target.starts_with(&installation_dir) {
+            bail!(
+                "managed command link resolves outside package {}: {}",
+                package.id,
+                link.display()
+            )
+        }
+        if !target.is_file() {
+            bail!("managed command target is not a file: {}", target.display())
+        }
+        Ok(target)
+    }
+
     fn install(&mut self, input: &str, options: &InstallOptions) -> Result<()> {
         if options.version_url.is_some() && !input.contains("{{version}}") {
             bail!("--version-url requires the package URL to contain {{version}}")
