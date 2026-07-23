@@ -1,6 +1,7 @@
 use crate::archive::{self, Format};
 use crate::compat;
 use crate::db::{self, Database};
+use crate::manifest::{Entry, Manifest};
 use crate::model::{HttpValidators, PackageId, PackageRecord, RenameRule, SourceKind};
 use crate::policy::Channel;
 use crate::scope::Scope;
@@ -38,6 +39,7 @@ pub struct InstallOptions {
     pub version_url: Option<String>,
     pub rename_rules: Vec<RenameRule>,
     pub relocate: bool,
+    pub default_pin: bool,
 }
 
 impl Installer {
@@ -49,14 +51,56 @@ impl Installer {
     }
 
     pub fn install_many(&self, inputs: &[String], options: &InstallOptions) -> Result<u8> {
+        self.preflight_manifest()?;
         if options.version_url.is_some() && inputs.len() != 1 {
             bail!("--version-url may only be used with one package")
         }
         self.session(|session| {
+            let mut manifest = self.load_manifest()?;
             let mut failed = false;
             for input in inputs {
-                if let Err(error) = session.install(input, options) {
-                    eprintln!("Error processing {input}: {error:#}");
+                let mut effective = options.clone();
+                effective.default_pin |= manifest.is_some();
+                match session.install(input, &effective) {
+                    Ok(outcome) => {
+                        if let Some(manifest) = &mut manifest
+                            && let Err(error) =
+                                manifest.upsert(&outcome.manifest_input, &outcome.record)
+                        {
+                            eprintln!("Error processing {input}: {error:#}");
+                            failed = true;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Error processing {input}: {error:#}");
+                        failed = true;
+                    }
+                }
+            }
+            if let Some(manifest) = &mut manifest {
+                manifest.save()?;
+            }
+            Ok(u8::from(failed))
+        })
+    }
+
+    pub fn install_manifest(&self, actions: &InstallOptions) -> Result<u8> {
+        let Some(preflight) = self.preflight_manifest()? else {
+            bail!("install requires at least one package outside local scope")
+        };
+        if preflight.entries().next().is_none() {
+            return Ok(0);
+        }
+        self.session(|session| {
+            let manifest = self
+                .load_manifest()?
+                .context("local scope does not have a package manifest")?;
+            let entries = manifest.entries().cloned().collect::<Vec<_>>();
+            let mut failed = false;
+            for entry in entries {
+                let options = manifest_install_options(actions, &entry);
+                if let Err(error) = session.install(&entry.input, &options) {
+                    eprintln!("Error processing {}: {error:#}", entry.input);
                     failed = true;
                 }
             }
@@ -85,10 +129,12 @@ impl Installer {
         pin: Option<bool>,
         channel: Option<Channel>,
     ) -> Result<u8> {
+        self.preflight_manifest()?;
         self.session(|session| {
+            let mut manifest = self.load_manifest()?;
             let mut failed = false;
             for id in ids {
-                let result = (|| -> Result<()> {
+                let result = (|| -> Result<PackageRecord> {
                     let package = session
                         .database
                         .package(id)?
@@ -102,25 +148,56 @@ impl Installer {
                     db::mark_package(&transaction, id, pin, channel)?;
                     transaction.commit()?;
                     println!("Marked {id}");
-                    Ok(())
+                    session
+                        .database
+                        .package(id)?
+                        .with_context(|| format!("package ID not installed after marking: {id}"))
                 })();
-                if let Err(error) = result {
-                    eprintln!("Error processing {id}: {error:#}");
-                    failed = true;
+                match result {
+                    Ok(package) => {
+                        if let Some(manifest) = &mut manifest
+                            && let Err(error) = manifest.update_existing(&package)
+                        {
+                            eprintln!("Error processing {id}: {error:#}");
+                            failed = true;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Error processing {id}: {error:#}");
+                        failed = true;
+                    }
                 }
+            }
+            if let Some(manifest) = &mut manifest {
+                manifest.save()?;
             }
             Ok(u8::from(failed))
         })
     }
 
     pub fn uninstall_many(&self, ids: &[String]) -> Result<u8> {
+        self.preflight_manifest()?;
         self.session(|session| {
+            let mut manifest = self.load_manifest()?;
             let mut failed = false;
             for id in ids {
-                if let Err(error) = session.uninstall(id) {
-                    eprintln!("Error processing {id}: {error:#}");
-                    failed = true;
+                match session.uninstall(id) {
+                    Ok(package) => {
+                        if let Some(manifest) = &mut manifest
+                            && let Err(error) = manifest.remove(&package)
+                        {
+                            eprintln!("Error processing {id}: {error:#}");
+                            failed = true;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Error processing {id}: {error:#}");
+                        failed = true;
+                    }
                 }
+            }
+            if let Some(manifest) = &mut manifest {
+                manifest.save()?;
             }
             Ok(u8::from(failed))
         })
@@ -200,6 +277,28 @@ impl Installer {
         };
         operation(&mut session)
     }
+
+    fn preflight_manifest(&self) -> Result<Option<Manifest>> {
+        self.scope.manifest().map(Manifest::load).transpose()
+    }
+
+    fn load_manifest(&self) -> Result<Option<Manifest>> {
+        self.scope.manifest().map(Manifest::load).transpose()
+    }
+}
+
+fn manifest_install_options(actions: &InstallOptions, entry: &Entry) -> InstallOptions {
+    InstallOptions {
+        force: actions.force,
+        pin: entry.options.pin,
+        channel: entry.options.channel,
+        reinstall: actions.reinstall,
+        ignore_existing: actions.ignore_existing,
+        version_url: entry.options.version_url.clone(),
+        rename_rules: entry.options.rename_rules.clone(),
+        relocate: false,
+        default_pin: true,
+    }
 }
 
 struct Session<'a> {
@@ -212,6 +311,11 @@ struct Session<'a> {
 enum PinNotice {
     Automatic,
     UnpinIgnored,
+}
+
+struct InstallOutcome {
+    record: PackageRecord,
+    manifest_input: String,
 }
 
 impl Session<'_> {
@@ -267,7 +371,7 @@ impl Session<'_> {
         Ok(target)
     }
 
-    fn install(&mut self, input: &str, options: &InstallOptions) -> Result<()> {
+    fn install(&mut self, input: &str, options: &InstallOptions) -> Result<InstallOutcome> {
         if options.version_url.is_some() && !input.contains("{{version}}") {
             bail!("--version-url requires the package URL to contain {{version}}")
         }
@@ -292,9 +396,14 @@ impl Session<'_> {
         )?;
         let installed = self.database.package(&initial.id)?;
 
-        if options.ignore_existing && installed.is_some() {
+        if options.ignore_existing
+            && let Some(record) = &installed
+        {
             println!("Skipped {}: already installed", initial.id);
-            return Ok(());
+            return Ok(InstallOutcome {
+                manifest_input: installed_manifest_input(input, record),
+                record: record.clone(),
+            });
         }
         if installed.is_some()
             && !options.reinstall
@@ -307,7 +416,10 @@ impl Session<'_> {
             if !options.reinstall {
                 if installed.pinned {
                     println!("Skipped {}: pinned", installed.id);
-                    return Ok(());
+                    return Ok(InstallOutcome {
+                        manifest_input: installed_manifest_input(input, installed),
+                        record: installed.clone(),
+                    });
                 }
                 source::resolve_with_store(
                     self.client,
@@ -333,7 +445,10 @@ impl Session<'_> {
             )?
         {
             println!("Unchanged {}", installed.id);
-            return Ok(());
+            return Ok(InstallOutcome {
+                manifest_input: installed_manifest_input(input, installed),
+                record: installed.clone(),
+            });
         }
 
         let mut prepared = prepare(self.client, self.scope, &resolved)?;
@@ -352,7 +467,7 @@ impl Session<'_> {
                 options.pin,
                 installed.as_ref().map(|package| package.pinned),
                 options.reinstall,
-                resolved.automatic_pin && version_check_url.is_none(),
+                options.default_pin || (resolved.automatic_pin && version_check_url.is_none()),
             ),
             resolved.kind,
             version_check_url.as_deref(),
@@ -411,6 +526,10 @@ impl Session<'_> {
             updated_at: installed.as_ref().map(|_| now),
             binaries: prepared.binary_names(),
         };
+        let outcome = InstallOutcome {
+            record: record.clone(),
+            manifest_input: input.to_owned(),
+        };
         self.activate(prepared, installed.as_ref(), record, options.force)?;
         println!(
             "{} {} in {}",
@@ -433,7 +552,7 @@ impl Session<'_> {
             ),
             None => {}
         }
-        Ok(())
+        Ok(outcome)
     }
 
     fn probe_update(&self, id: &str) -> Result<UpdateProbe> {
@@ -628,7 +747,7 @@ impl Session<'_> {
         Ok(())
     }
 
-    fn uninstall(&mut self, id: &str) -> Result<()> {
+    fn uninstall(&mut self, id: &str) -> Result<PackageRecord> {
         let package = self
             .database
             .package(id)?
@@ -684,7 +803,15 @@ impl Session<'_> {
             .close()
             .context("remove quarantined package contents")?;
         println!("Uninstalled {id} in {}", self.scope.description());
-        Ok(())
+        Ok(package)
+    }
+}
+
+fn installed_manifest_input(input: &str, package: &PackageRecord) -> String {
+    if package.source_kind == SourceKind::Direct {
+        package.installed_asset_url.clone()
+    } else {
+        input.to_owned()
     }
 }
 

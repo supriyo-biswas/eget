@@ -63,7 +63,6 @@ enum Command {
         #[arg(long = "rename", value_parser = parse_rename, value_name = "FROM=TO")]
         rename_rules: Vec<RenameRule>,
         /// Repository, package ID, or direct URL
-        #[arg(required = true)]
         package: Vec<String>,
     },
     /// List installed packages
@@ -146,9 +145,8 @@ pub fn run(args: Vec<OsString>) -> Result<u8> {
             rename_rules,
             package,
             ..
-        } => installer.install_many(
-            &package,
-            &InstallOptions {
+        } => {
+            let options = InstallOptions {
                 force,
                 pin: flag_value(pin, unpin),
                 channel,
@@ -157,8 +155,23 @@ pub fn run(args: Vec<OsString>) -> Result<u8> {
                 version_url,
                 rename_rules,
                 relocate,
-            },
-        ),
+                default_pin: false,
+            };
+            if package.is_empty() {
+                if options.pin.is_some()
+                    || options.channel.is_some()
+                    || options.version_url.is_some()
+                    || !options.rename_rules.is_empty()
+                {
+                    bail!(
+                        "package-specific install options require an explicit package; put durable options on each eget-packages.txt line"
+                    )
+                }
+                installer.install_manifest(&options)
+            } else {
+                installer.install_many(&package, &options)
+            }
+        }
         Command::List { filter } => installer.list(&filter),
         Command::Mark {
             pin,

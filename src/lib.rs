@@ -3,6 +3,7 @@ pub mod cli;
 pub mod compat;
 pub mod db;
 pub mod installer;
+pub mod manifest;
 pub mod model;
 pub mod policy;
 pub mod scope;

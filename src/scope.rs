@@ -37,6 +37,7 @@ pub struct Scope {
     pub bin_dir: PathBuf,
     pub legacy_database: Option<PathBuf>,
     local_root: Option<PathBuf>,
+    manifest: Option<PathBuf>,
 }
 
 impl Scope {
@@ -102,6 +103,7 @@ impl Scope {
                     bin_dir: override_bin().unwrap_or_else(|| PathBuf::from("/usr/local/bin")),
                     legacy_database: Some(PathBuf::from("/var/opt/eget/eget.sqlite3")),
                     local_root: None,
+                    manifest: None,
                 })
             }
             ScopeKind::User => {
@@ -127,6 +129,7 @@ impl Scope {
                     bin_dir: override_bin().unwrap_or_else(|| home.join(".local/bin")),
                     legacy_database: Some(legacy_state),
                     local_root: None,
+                    manifest: None,
                 })
             }
             ScopeKind::Local => {
@@ -147,6 +150,7 @@ impl Scope {
                     lock: state.join("eget.lock"),
                     bin_dir: state.join("bin"),
                     legacy_database: None,
+                    manifest: Some(local_root.join("eget-packages.txt")),
                     local_root: Some(local_root),
                 })
             }
@@ -197,6 +201,10 @@ impl Scope {
         }
     }
 
+    pub fn manifest(&self) -> Option<&Path> {
+        self.manifest.as_deref()
+    }
+
     #[doc(hidden)]
     pub fn from_paths(package_root: PathBuf, state_root: PathBuf, bin_dir: PathBuf) -> Self {
         let local_root = package_root.parent().map(Path::to_path_buf);
@@ -208,6 +216,7 @@ impl Scope {
             bin_dir,
             legacy_database: None,
             local_root,
+            manifest: None,
         }
     }
 }

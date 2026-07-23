@@ -334,8 +334,12 @@ pub fn package_identity_hint(
         .unwrap_or(SourceKind::Direct);
     if kind == SourceKind::Direct {
         let app = direct_app(&url);
+        let mut owner = normalized_owner(host);
+        if let Some(port) = url.port() {
+            owner.push_str(&format!(":{port}"));
+        }
         return Ok(PackageIdentityHint {
-            ids: vec![format!("{}/{}", normalized_owner(host), app)],
+            ids: vec![format!("{owner}/{app}")],
             exact: false,
         });
     }
@@ -2067,6 +2071,15 @@ mod tests {
             .unwrap()
             .ids,
             ["downloads.example/tool"]
+        );
+        assert_eq!(
+            package_identity_hint(
+                "https://downloads.example:8443/tool-v2-linux-amd64.tar.gz",
+                Some(SourceKind::Direct)
+            )
+            .unwrap()
+            .ids,
+            ["downloads.example:8443/tool"]
         );
     }
 

@@ -46,7 +46,7 @@ The default values of these variables depend on the scope, determined by the env
 
 For root users, the default scope is `system`; they may explicitly choose `user` or `local`. For non-root users, an unspecified scope first attempts local discovery and falls back to `user`; `system` is disallowed. Explicit `user` or `system` selection bypasses local discovery. Explicit `local` selection requires discovery to succeed rather than falling back.
 
-For local discovery, canonicalize the current directory and `HOME`, then inspect the current directory and each parent in turn. Stop without inspecting a directory when it is canonical `HOME` or its owner differs from the effective UID. The first owned directory containing a regular, non-symlink `eget-packages.txt` is the local project root. Thus a marker directly in `HOME` is invalid, while the nearest marker below it wins. Root follows the same ownership rule when local scope is explicitly requested, so only root-owned directories are considered. The marker's contents are not read or modified.
+For local discovery, canonicalize the current directory and `HOME`, then inspect the current directory and each parent in turn. Stop without inspecting a directory when it is canonical `HOME` or its owner differs from the effective UID. The first owned directory containing a regular, non-symlink `eget-packages.txt` is the local project root. Thus a marker directly in `HOME` is invalid, while the nearest marker below it wins. Root follows the same ownership rule when local scope is explicitly requested, so only root-owned directories are considered. The marker is also the local package manifest described below.
 
 The following paths are used. XDG variables use their FreeDesktop fallbacks when unset; the user lock falls back from `$XDG_RUNTIME_DIR` to `$XDG_DATA_HOME`.
 
@@ -337,6 +337,16 @@ Every paginated release or tag scan requests the forge's maximum supported page 
 
 This same channel-aware lookup (fetch-latest-and-compare, or forge-appropriate prefix scan once a selector is known) is used both for the initial `install` and for subsequent `update` runs.
 
+### Local package manifest
+
+`eget-packages.txt` contains the desired packages for its local scope, one package location and its durable install options per non-empty line. Lines use shell word splitting: whitespace separates words, single and double quotes and backslash escapes are supported, and an unquoted `#` begins a comment. Blank and comment-only lines are ignored. Each entry accepts `--pin`/`--unpin` (`--no-pin`), `--channel`, `--version-url`, and repeated `--rename` options in either `--option value` or `--option=value` form. Run-only options (`--force`, `--reinstall`, `--ignore-existing`, and `--to`), unknown options, multiple package locations, malformed quoting, and duplicate package identities make the manifest invalid. Diagnostics identify the file and line, and the entire manifest is validated before installation begins.
+
+`eget install` with no package operands is valid only in local scope. It installs every manifest entry, continuing after individual source or installation failures, and returns nonzero if any entry failed. Command-line `--force`, `--reinstall`, and `--ignore-existing` apply to every entry for that run without modifying the file. Package-specific durable options must be written on their entry. An empty local manifest is a successful no-op. Manifest-driven installation never normalizes or rewrites hand-authored entries, including an untagged forge entry that resolves to a concrete release.
+
+An explicit local `eget install <locref...>` defaults fresh packages to pinned unless `--unpin` is supplied. Every successful operand, including one reported as skipped or unchanged, is added to the manifest or replaces its existing entry in place using the actual installed state. Pinned forge packages are stored as a canonical host-qualified package locref with the exact installed release tag when available; tracking forge packages use the canonical package ID plus `--no-pin`. Direct URLs and `{{version}}` templates remain URLs. Rendering omits redundant pinned/stable defaults and records tracking state, prerelease channel, version URL, and rename rules in deterministic order.
+
+Successful local uninstalls remove the matching manifest entry. A successful local `mark` rewrites the policy of a matching entry from the resulting installed record but does not add an unlisted package. `update` never rewrites the manifest. Blank lines, comments, entry order, and unrelated entry text are preserved. Successful changes from a partially failing batch are written once through an atomic same-directory replacement; a manifest write failure is reported without rolling back package mutations that already committed.
+
 ### Installation
 
 Given a resolved package ID, source kind, and downloadable asset URL (from the probe/resolution steps above), plus channel/pin selection where applicable:
@@ -354,7 +364,7 @@ Given a resolved package ID, source kind, and downloadable asset URL (from the p
    Candidates are attempted in descending score order until one yields at least one compatible executable. If all candidates fail, installation reports the failure associated with each candidate.
 2. **Idempotency / re-install / update semantics:**
    * A forge tag or canonical release-download URL automatically pins the selected version. `--unpin` overrides this source-derived pinning.
-   * If no package with this ID is currently tracked, this is a fresh install: proceed to download using the requested or source-derived pin policy and requested channel (defaulting to tracking/`stable`), and record them.
+   * If no package with this ID is currently tracked, this is a fresh install: proceed to download using the requested or source-derived pin policy and requested channel, and record them. The default channel is `stable`; pinning defaults to pinned in local scope and tracking in user/system scope.
    * If a package with this ID is already tracked:
      * Without `--reinstall`: this behaves like a **targeted update** for just this package. Existing explicit policy is preserved, but selecting an exact tag is itself an automatic-pinning operation: replacing a tracking installation with an exact version leaves it pinned unless `--unpin` was explicitly supplied. If the existing package is already pinned, or if the resolved version matches `current_version`, do nothing. Otherwise, proceed to install the selected version. This is what makes `eget install x; eget install x` idempotent-then-updating: the second invocation checks for and applies any update, but does no work if nothing changed.
      * With `--reinstall`: force re-download and re-linking even if the resolved version is unchanged, and additionally allow `--pin`/`--channel` (if passed) to overwrite the package's stored settings, exactly as `mark` would.
@@ -437,11 +447,11 @@ Uninstalling an installed package involves:
 
 The SQLite transaction and compensating filesystem restoration cover ordinary operation failures, but they cannot make SQLite and filesystem changes jointly crash-atomic. Crash recovery would require a persistent operation journal; temporary quarantine directories alone are not such a journal.
 
-A successful removal prints `Uninstalled <packageId> in <scope>`, using the same local-project path formatting as installation. Failed removals retain their existing output.
+A successful removal prints `Uninstalled <packageId> in <scope>`, using the same local-project path formatting as installation. In local scope, the matching manifest entry is removed after the package mutation succeeds. Failed removals retain their existing output and manifest entry.
 
 ### Mark
 
-`eget mark [--pin | --unpin] [--channel stable|prerelease] <packageId...>` updates the stored `pinned`/`channel` columns for already-tracked packages directly, without touching files, downloads, or symlinks. At least one policy option is required, and `--pin` conflicts with `--unpin`/`--no-pin`. This is the supported way to change package policy outside `install --reinstall`. Setting `--channel prerelease` on a GitLab package is rejected because GitLab's Releases API has no prerelease classification to preserve or query later.
+`eget mark [--pin | --unpin] [--channel stable|prerelease] <packageId...>` updates the stored `pinned`/`channel` columns for already-tracked packages directly, without touching files, downloads, or symlinks. At least one policy option is required, and `--pin` conflicts with `--unpin`/`--no-pin`. This is the supported way to change package policy outside `install --reinstall`. Setting `--channel prerelease` on a GitLab package is rejected because GitLab's Releases API has no prerelease classification to preserve or query later. In local scope, a matching manifest entry is rewritten from the resulting stored policy; an installed package absent from the manifest is not added.
 
 ### List
 
