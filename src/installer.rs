@@ -413,13 +413,14 @@ impl Session<'_> {
         };
         self.activate(prepared, installed.as_ref(), record, options.force)?;
         println!(
-            "{} {}",
+            "{} {} in {}",
             if installed.is_some() {
                 "Updated"
             } else {
                 "Installed"
             },
-            resolved.id
+            resolved.id,
+            self.scope.description()
         );
         match pin_notice {
             Some(PinNotice::Automatic) => eprintln!(
@@ -682,7 +683,7 @@ impl Session<'_> {
         quarantine
             .close()
             .context("remove quarantined package contents")?;
-        println!("Uninstalled {id}");
+        println!("Uninstalled {id} in {}", self.scope.description());
         Ok(())
     }
 }

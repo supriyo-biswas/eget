@@ -42,19 +42,21 @@ These are stored in the following locations, where `$var` represents an internal
 * **Package files:** `{$packageFilesDir}`
 * **Symlinks:** `{$binDir}`
 
-The default values of these variables depend on the scope, determined by the environment variable `EGET_SCOPE` or the global flag `--scope`, which is one of `system`, `user`, or `local`.
+The default values of these variables depend on the scope, determined by the environment variable `EGET_SCOPE`, the global flag `--scope`, or automatic local-scope discovery. A scope is one of `system`, `user`, or `local`.
 
-For root users, the default scope is `system`; they may choose between `system`, `user`, or `local`. For non-root users, the default scope is `user`; they may choose between `user` or `local` — `system` is disallowed.
+For root users, the default scope is `system`; they may explicitly choose `user` or `local`. For non-root users, an unspecified scope first attempts local discovery and falls back to `user`; `system` is disallowed. Explicit `user` or `system` selection bypasses local discovery. Explicit `local` selection requires discovery to succeed rather than falling back.
 
-The following directories are used, where `$ENV` is an environment variable of that name. For the XDG environment variables, the appropriate fallback values documented in the FreeDesktop XDG specification are used when unset. Where multiple variable names are listed consecutively, they are tried in that order.
+For local discovery, canonicalize the current directory and `HOME`, then inspect the current directory and each parent in turn. Stop without inspecting a directory when it is canonical `HOME` or its owner differs from the effective UID. The first owned directory containing a regular, non-symlink `eget-packages.txt` is the local project root. Thus a marker directly in `HOME` is invalid, while the nearest marker below it wins. Root follows the same ownership rule when local scope is explicitly requested, so only root-owned directories are considered. The marker's contents are not read or modified.
 
-|              | `$stateDir`            | `$lockDir`                              | `$packageFilesDir`   | `$binDir`             |
-| ------------ | ----------------------- | ---------------------------------------- | --------------------- | --------------------- |
-| System scope | `/var/lib/eget`         | `/run/lock`                               | `/opt/eget`           | `/usr/local/bin`      |
-| User scope   | `$XDG_DATA_HOME`        | `$XDG_RUNTIME_DIR`<br>`$XDG_DATA_HOME`   | `$XDG_DATA_HOME/eget` | `$HOME/.local/bin`    |
-| Local scope  | `$EGET_LOCAL_DATA_DIR`  | `$EGET_LOCAL_LOCK_DIR`                    | `$EGET_LOCAL_PKG_DIR` | `$EGET_LOCAL_BIN_DIR` |
+The following paths are used. XDG variables use their FreeDesktop fallbacks when unset; the user lock falls back from `$XDG_RUNTIME_DIR` to `$XDG_DATA_HOME`.
 
-When using the local scope, all of the local-scoped environment variables are mandatory. If the resolved directories do not already exist, `eget` attempts to create them when needed.
+|              | Metadata DB                                  | Lock file                        | Package files                       | Binary links             |
+| ------------ | -------------------------------------------- | -------------------------------- | ----------------------------------- | ------------------------ |
+| System scope | `/var/lib/eget/eget/eget.sqlite3`            | `/run/lock/eget.lock`            | `/opt/eget/<applicationIdHash>`     | `/usr/local/bin`         |
+| User scope   | `$XDG_DATA_HOME/eget/eget.sqlite3`           | `$XDG_RUNTIME_DIR/eget.lock`      | `$XDG_DATA_HOME/eget/<applicationIdHash>` | `$HOME/.local/bin` |
+| Local scope  | `<project>/.eget/eget.sqlite3`               | `<project>/.eget/eget.lock`       | `<project>/.eget/<applicationIdHash>` | `<project>/.eget/bin`  |
+
+`EGET_LOCAL_DATA_DIR`, `EGET_LOCAL_LOCK_DIR`, `EGET_LOCAL_PKG_DIR`, and `EGET_LOCAL_BIN_DIR` are not used. There is no migration from scopes previously configured through those variables. If the selected directories do not exist, `eget` creates them when an operation prepares the scope.
 
 The symlink directory may be overridden per-invocation of `install` when in `user` or `system` scope, via the `--to` flag, or the `EGET_BIN_DIR`/`EGET_BIN` environment variables. If more than one is set, precedence is `--to` > `EGET_BIN_DIR` > `EGET_BIN` > the scope's default `$binDir`. These overrides are disallowed in `local` scope.
 
@@ -380,6 +382,8 @@ Given a resolved package ID, source kind, and downloadable asset URL (from the p
 
 Command names are exclusive filesystem resources. Installation never replaces a conflicting path implicitly; `--force` is required even when the conflicting entry is an untracked symlink or regular file. Update does not imply `--force` for newly introduced command names.
 
+After a successful mutation through `install`, the result names its scope: `Installed <packageId> in user scope`, `Updated <packageId> in system scope`, or `Installed <packageId> in local scope (~/project)`. A local project path is canonical and displayed relative to canonical `HOME` with `~/` when possible, or as an absolute path otherwise. Skipped, unchanged, and failed installs retain their existing output. Updates performed by the separate `update` command also retain their existing output.
+
 ### Direct-URL version tracking
 
 Forge-hosted packages have a natural notion of "version" (the release tag). Plain `direct`-kind packages generally don't — a bare URL like `https://dl.min.io/aistor/mc/release/linux-amd64/mc` has no version string anywhere, only bytes that may or may not have changed. `eget` supports two modes for tracking a direct package's version:
@@ -432,6 +436,8 @@ Uninstalling an installed package involves:
 8. Permanently remove the quarantined contents after the DB commit succeeds.
 
 The SQLite transaction and compensating filesystem restoration cover ordinary operation failures, but they cannot make SQLite and filesystem changes jointly crash-atomic. Crash recovery would require a persistent operation journal; temporary quarantine directories alone are not such a journal.
+
+A successful removal prints `Uninstalled <packageId> in <scope>`, using the same local-project path formatting as installation. Failed removals retain their existing output.
 
 ### Mark
 

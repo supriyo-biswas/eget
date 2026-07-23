@@ -8,19 +8,24 @@ use std::process::{Command, Output};
 
 struct ExecFixture {
     temp: tempfile::TempDir,
+    project: PathBuf,
     scope: Scope,
 }
 
 impl ExecFixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let scope = Scope::from_paths(
-            temp.path().join("packages"),
-            temp.path().join("data/eget"),
-            temp.path().join("bin"),
-        );
+        let project = temp.path().join("home/project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("eget-packages.txt"), "").unwrap();
+        let state = project.join(".eget");
+        let scope = Scope::from_paths(state.clone(), state.clone(), state.join("bin"));
         scope.prepare().unwrap();
-        Self { temp, scope }
+        Self {
+            temp,
+            project,
+            scope,
+        }
     }
 
     fn add_package(&self, id: &str, bin_dir: &Path, command: &str, script: &str) -> PathBuf {
@@ -67,10 +72,8 @@ impl ExecFixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_eget"));
         command
             .arg("--scope=local")
-            .env("EGET_LOCAL_DATA_DIR", self.temp.path().join("data"))
-            .env("EGET_LOCAL_LOCK_DIR", self.temp.path().join("data/eget"))
-            .env("EGET_LOCAL_PKG_DIR", &self.scope.package_root)
-            .env("EGET_LOCAL_BIN_DIR", &self.scope.bin_dir)
+            .current_dir(&self.project)
+            .env("HOME", self.temp.path().join("home"))
             .env_remove("EGET_BIN_DIR")
             .env_remove("EGET_BIN");
         command
@@ -84,7 +87,7 @@ impl ExecFixture {
 #[test]
 fn exec_replaces_eget_and_inherits_arguments_environment_and_working_directory() {
     let fixture = ExecFixture::new();
-    let working_directory = fixture.temp.path().join("work");
+    let working_directory = fixture.project.join("work");
     fs::create_dir(&working_directory).unwrap();
     fixture.add_package(
         "example.com/alpha",
