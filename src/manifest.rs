@@ -1,6 +1,7 @@
 use crate::model::{PackageRecord, RenameRule, SourceKind};
 use crate::policy::Channel;
 use crate::source;
+use crate::template::UrlTemplate;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::fs;
@@ -125,7 +126,12 @@ impl Manifest {
             let Some(entry) = &line.entry else {
                 continue;
             };
-            let hint = source::package_identity_hint(&entry.input, Some(package.source_kind))
+            let identity_input = identity_input(
+                &entry.input,
+                entry.options.version_url.is_some(),
+                package.current_version.as_deref(),
+            )?;
+            let hint = source::package_identity_hint(&identity_input, Some(package.source_kind))
                 .with_context(|| {
                     format!(
                         "identify package manifest entry {}:{}",
@@ -254,9 +260,7 @@ fn parse_entry(text: &str, line: usize) -> Result<Option<Entry>> {
     }
 
     let input = input.context("package manifest line does not contain a package location")?;
-    if options.version_url.is_some() && !input.contains("{{version}}") {
-        bail!("--version-url requires the package URL to contain {{version}}")
-    }
+    UrlTemplate::parse(&input, options.version_url.is_some())?;
     Ok(Some(Entry {
         line,
         input,
@@ -313,7 +317,9 @@ fn validate_duplicates(path: &Path, lines: &[DocumentLine]) -> Result<()> {
         let Some(entry) = &line.entry else {
             continue;
         };
-        let ids = source::package_identity_hint(&entry.input, None)
+        let identity_input =
+            identity_input(&entry.input, entry.options.version_url.is_some(), None)?;
+        let ids = source::package_identity_hint(&identity_input, None)
             .with_context(|| {
                 format!(
                     "identify package manifest entry {}:{}",
@@ -338,6 +344,14 @@ fn validate_duplicates(path: &Path, lines: &[DocumentLine]) -> Result<()> {
         identities.push((entry.line, ids));
     }
     Ok(())
+}
+
+fn identity_input(input: &str, has_version_url: bool, version: Option<&str>) -> Result<String> {
+    let template = UrlTemplate::parse(input, has_version_url)?;
+    let version = template
+        .needs_version()
+        .then_some(version.unwrap_or("0.0.0"));
+    template.render_current(version)
 }
 
 fn render_entry(input: &str, package: &PackageRecord) -> String {
@@ -458,11 +472,12 @@ mod tests {
         let manifest = load(
             "# tools\nBurntSushi/ripgrep:1.9\n\
              'https://example.com/tool-{{version}}.tar.gz' --version-url \
-             'https://example.com/latest version.txt' --rename 'tool=other tool' # note\n",
+             'https://example.com/latest version.txt' --rename 'tool=other tool' # note\n\
+             \"https://example.com/other-{{kernel}}-{% if arch == 'x86_64' %}amd64{% else %}arm64{% endif %}.tar.gz\"\n",
         )
         .unwrap();
         let entries = manifest.entries().collect::<Vec<_>>();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].input, "BurntSushi/ripgrep:1.9");
         assert_eq!(
             entries[1].options.version_url.as_deref(),
@@ -471,6 +486,10 @@ mod tests {
         assert_eq!(
             entries[1].options.rename_rules,
             [RenameRule("tool".into(), "other tool".into())]
+        );
+        assert_eq!(
+            entries[2].input,
+            "https://example.com/other-{{kernel}}-{% if arch == 'x86_64' %}amd64{% else %}arm64{% endif %}.tar.gz"
         );
     }
 

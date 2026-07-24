@@ -22,7 +22,7 @@ struct Cli {
         long,
         global = true,
         env = "EGET_SCOPE",
-        value_name = "system|user|local"
+        value_name = "system|user|project"
     )]
     scope: Option<ScopeKind>,
 
@@ -56,7 +56,7 @@ enum Command {
         /// Directory in which command symlinks are created
         #[arg(long, value_name = "DIRECTORY")]
         to: Option<PathBuf>,
-        /// Endpoint that resolves the version used in a {{version}} URL template
+        /// Endpoint that resolves the version exposed to a direct URL template
         #[arg(long, value_name = "URL")]
         version_url: Option<String>,
         /// Rename a discovered command, expressed as FROM=TO

@@ -26,7 +26,7 @@ fn elf_format_architecture_and_runnable_kind_are_enforced() {
     assert!(compat::inspect(&fixture("elf-x86_64-pie"), linux(HostArch::X86_64)).unwrap());
     assert!(compat::inspect(&fixture("elf-x86_64-static-pie"), linux(HostArch::X86_64)).unwrap());
     assert!(!compat::inspect(&fixture("elf-x86_64-shared"), linux(HostArch::X86_64)).unwrap());
-    assert!(compat::inspect(&fixture("elf-x86_64-freebsd"), linux(HostArch::X86_64)).unwrap());
+    assert!(!compat::inspect(&fixture("elf-x86_64-freebsd"), linux(HostArch::X86_64)).unwrap());
     assert!(
         compat::inspect(
             &fixture("elf-x86_64-missing-loader"),

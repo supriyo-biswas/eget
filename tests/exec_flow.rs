@@ -71,7 +71,7 @@ impl ExecFixture {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_eget"));
         command
-            .arg("--scope=local")
+            .arg("--scope=project")
             .current_dir(&self.project)
             .env("HOME", self.temp.path().join("home"))
             .env_remove("EGET_BIN_DIR")

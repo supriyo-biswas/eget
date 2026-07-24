@@ -138,7 +138,7 @@ when it is a monorepo repository, e.g.
 
 ```console
 $ eget install kubernetes-sigs/kustomize
-Installed github.com/kubernetes-sigs/kustomize:kustomize
+Installed github.com/kubernetes-sigs/kustomize:kustomize in project scope
 ```
 
 ## Authentication and private repositories
@@ -179,6 +179,78 @@ In rare cases, when operating as the root user, you may want to install a
 package for use by the root user only. In these cases, use
 `eget --scope=user ...` (or `EGET_SCOPE=user`), which will put the binaries in
 `/root/.local/bin` and the package contents in `/root/.local/share/eget`.
+
+## Using as a project package manager
+
+`eget` also supports usage as a project-level package manager, which means you
+can have per-project tooling without installing packages globally. In this
+`project` scope of operation, `eget` will pin package dependencies
+automatically so that people can use the same dependency versions when working
+on the project.
+
+Start by initializing a `eget-packages.txt` file in your project directory,
+and then installing some tools, which you can execute using `eget x`
+(or `eget exec`):
+
+```console
+$ > eget-packages.txt # create the file
+
+$ eget getsops/sops
+Installed github.com/getsops/sops in project scope (~/my-project)
+
+$ eget x sops --version
+sops 3.13.3 (latest)
+
+$ cat eget-packages.txt # updated with new packages
+github.com/getsops/sops:v3.13.3
+```
+
+When using a direct URL, you may need to substitute kernel and architecture
+parameters since the project may be used on different OSes and architectures.
+You can use MiniJinja expressions with conditional statements. For example, to
+install go and node, you might use:
+
+```console
+eget install \
+  "https://go.dev/dl/go1.26.0.{{kernel}}-{% if arch == 'x86_64' %}amd64{% else %}arm64{% endif %}.tar.gz"
+  "https://nodejs.org/dist/latest/node-v26.5.0-{{kernel}}-{% if arch == 'x86_64' %}x64{% else %}arm64{% endif %}.tar.xz"
+```
+
+Then, you can use `eget x` as before:
+
+```console
+$ eget x go version
+go version go1.26.5 linux/amd64
+
+$ eget x node --version
+v26.5.0
+```
+
+## Automated command activation
+
+To avoid having to always prefix each command with `eget x`, you can use
+[direnv](https://direnv.net/). Install per the
+[instructions here](https://direnv.net/docs/installation.html) and configure
+the `.envrc` project in your project directory, e.g:
+
+```
+cd my-project
+echo 'export PATH="$PWD/.eget/bin:$PATH"' > .envrc
+```
+
+Then, run `direnv allow` to whitelist the `.envrc` to be executed
+automatically when you `cd` into the directory. From now on, the project
+scoped binaries will be activated automatically for shells inside inside it:
+
+```console
+$ cd my-project/
+direnv: loading ~/my-project/.envrc
+direnv: export ~PATH
+$ which node
+/home/me/my-project/.eget/bin/node
+$ which go
+/home/me/my-project/.eget/bin/go
+```
 
 ## More information
 

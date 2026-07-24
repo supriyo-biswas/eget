@@ -8,3 +8,4 @@ pub mod model;
 pub mod policy;
 pub mod scope;
 pub mod source;
+mod template;

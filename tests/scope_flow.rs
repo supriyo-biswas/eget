@@ -35,7 +35,7 @@ fn server(body: &'static [u8]) -> (String, thread::JoinHandle<()>) {
 }
 
 #[test]
-fn local_install_and_uninstall_report_scope_and_use_project_state() {
+fn project_install_and_uninstall_report_scope_and_use_project_state() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let project = home.join("project");
@@ -47,7 +47,7 @@ fn local_install_and_uninstall_report_scope_and_use_project_state() {
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_eget"));
         command
-            .arg("--scope=local")
+            .arg("--scope=project")
             .current_dir(&project)
             .env("HOME", &home)
             .env_remove("EGET_SCOPE")
@@ -64,7 +64,7 @@ fn local_install_and_uninstall_report_scope_and_use_project_state() {
     let package = database.packages().unwrap().pop().unwrap();
     assert_eq!(
         String::from_utf8(install.stdout).unwrap(),
-        format!("Installed {} in local scope (~/project)\n", package.id)
+        format!("Installed {} in project scope (~/project)\n", package.id)
     );
     assert!(state.join("bin/tool").is_symlink());
     assert!(package.pinned);
@@ -90,13 +90,13 @@ fn local_install_and_uninstall_report_scope_and_use_project_state() {
     assert!(uninstall.status.success(), "{:?}", uninstall.stderr);
     assert_eq!(
         String::from_utf8(uninstall.stdout).unwrap(),
-        format!("Uninstalled {} in local scope (~/project)\n", package.id)
+        format!("Uninstalled {} in project scope (~/project)\n", package.id)
     );
     assert_eq!(std::fs::read_to_string(marker).unwrap(), "");
 }
 
 #[test]
-fn bare_local_install_reads_the_manifest_without_rewriting_it() {
+fn bare_project_install_reads_the_manifest_without_rewriting_it() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let project = home.join("project");
@@ -143,23 +143,23 @@ fn bare_local_install_reads_the_manifest_without_rewriting_it() {
 }
 
 #[test]
-fn bare_install_requires_local_scope_and_package_flags_belong_in_the_manifest() {
+fn bare_install_requires_project_scope_and_package_flags_belong_in_the_manifest() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
 
-    let outside_local = Command::new(env!("CARGO_BIN_EXE_eget"))
+    let outside_project = Command::new(env!("CARGO_BIN_EXE_eget"))
         .args(["--scope=user", "install"])
         .current_dir(&home)
         .env("HOME", &home)
         .env_remove("EGET_SCOPE")
         .output()
         .unwrap();
-    assert!(!outside_local.status.success());
+    assert!(!outside_project.status.success());
     assert!(
-        String::from_utf8(outside_local.stderr)
+        String::from_utf8(outside_project.stderr)
             .unwrap()
-            .contains("install requires at least one package outside local scope")
+            .contains("install requires at least one package outside project scope")
     );
 
     let project = home.join("project");
@@ -225,7 +225,7 @@ fn invalid_manifest_fails_before_network_access() {
 }
 
 #[test]
-fn explicit_local_install_records_successes_from_a_partially_failing_batch() {
+fn explicit_project_install_records_successes_from_a_partially_failing_batch() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let project = home.join("project");

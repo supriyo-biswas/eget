@@ -105,11 +105,23 @@ fn inspect_object<'a, R: object::read::ReadRef<'a>>(data: R, host: Host) -> Resu
     }
     match host.os {
         HostOs::Macos => Ok(file.kind() == ObjectKind::Executable),
-        HostOs::Linux => Ok(
-            matches!(file.kind(), ObjectKind::Executable | ObjectKind::Dynamic)
-                && file.entry() != 0,
-        ),
+        HostOs::Linux => {
+            let os_abi = match &file {
+                object::File::Elf64(elf) => elf.elf_header().e_ident.os_abi,
+                _ => return Ok(false),
+            };
+            Ok(linux_elf_os_abi(os_abi)
+                && matches!(file.kind(), ObjectKind::Executable | ObjectKind::Dynamic)
+                && file.entry() != 0)
+        }
     }
+}
+
+fn linux_elf_os_abi(os_abi: u8) -> bool {
+    matches!(
+        os_abi,
+        object::elf::ELFOSABI_SYSV | object::elf::ELFOSABI_GNU
+    )
 }
 
 fn shared_library_name(path: &Path) -> bool {
@@ -283,6 +295,20 @@ mod tests {
             )
             .unwrap()
         )
+    }
+
+    #[test]
+    fn linux_elf_os_abi_rejects_other_unices() {
+        assert!(linux_elf_os_abi(object::elf::ELFOSABI_SYSV));
+        assert!(linux_elf_os_abi(object::elf::ELFOSABI_GNU));
+        for os_abi in [
+            object::elf::ELFOSABI_NETBSD,
+            object::elf::ELFOSABI_SOLARIS,
+            object::elf::ELFOSABI_FREEBSD,
+            object::elf::ELFOSABI_OPENBSD,
+        ] {
+            assert!(!linux_elf_os_abi(os_abi));
+        }
     }
 
     fn write_script(path: &Path) {

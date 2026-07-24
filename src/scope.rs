@@ -12,7 +12,7 @@ use std::str::FromStr;
 pub enum ScopeKind {
     System,
     User,
-    Local,
+    Project,
 }
 
 impl FromStr for ScopeKind {
@@ -22,8 +22,8 @@ impl FromStr for ScopeKind {
         match value {
             "system" => Ok(Self::System),
             "user" => Ok(Self::User),
-            "local" => Ok(Self::Local),
-            _ => bail!("invalid scope {value:?}; expected system, user, or local"),
+            "project" => Ok(Self::Project),
+            _ => bail!("invalid scope {value:?}; expected system, user, or project"),
         }
     }
 }
@@ -36,7 +36,7 @@ pub struct Scope {
     pub lock: PathBuf,
     pub bin_dir: PathBuf,
     pub legacy_database: Option<PathBuf>,
-    local_root: Option<PathBuf>,
+    project_root: Option<PathBuf>,
     manifest: Option<PathBuf>,
 }
 
@@ -48,35 +48,40 @@ impl Scope {
             .map(|value| value.parse())
             .transpose()?;
         let requested = requested.or(environment_scope);
-        let local_root =
-            if requested == Some(ScopeKind::Local) || (requested.is_none() && effective_uid != 0) {
-                let home = env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .context("HOME is not set")?;
-                let current = env::current_dir().context("get current directory")?;
-                find_local_root(&current, &home, effective_uid, |path| {
-                    Ok(fs::metadata(path)?.uid())
-                })?
-            } else {
-                None
-            };
-        Self::resolve(requested, destination, effective_uid, local_root, |name| {
-            env::var_os(name)
-        })
+        let project_root = if requested == Some(ScopeKind::Project)
+            || (requested.is_none() && effective_uid != 0)
+        {
+            let home = env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is not set")?;
+            let current = env::current_dir().context("get current directory")?;
+            find_project_root(&current, &home, effective_uid, |path| {
+                Ok(fs::metadata(path)?.uid())
+            })?
+        } else {
+            None
+        };
+        Self::resolve(
+            requested,
+            destination,
+            effective_uid,
+            project_root,
+            |name| env::var_os(name),
+        )
     }
 
     fn resolve(
         requested: Option<ScopeKind>,
         destination: Option<PathBuf>,
         effective_uid: u32,
-        local_root: Option<PathBuf>,
+        project_root: Option<PathBuf>,
         environment: impl Fn(&str) -> Option<OsString>,
     ) -> Result<Self> {
         let kind = requested.unwrap_or_else(|| {
             if effective_uid == 0 {
                 ScopeKind::System
-            } else if local_root.is_some() {
-                ScopeKind::Local
+            } else if project_root.is_some() {
+                ScopeKind::Project
             } else {
                 ScopeKind::User
             }
@@ -102,7 +107,7 @@ impl Scope {
                     lock: PathBuf::from("/run/lock/eget.lock"),
                     bin_dir: override_bin().unwrap_or_else(|| PathBuf::from("/usr/local/bin")),
                     legacy_database: Some(PathBuf::from("/var/opt/eget/eget.sqlite3")),
-                    local_root: None,
+                    project_root: None,
                     manifest: None,
                 })
             }
@@ -128,21 +133,21 @@ impl Scope {
                     lock: runtime.join("eget.lock"),
                     bin_dir: override_bin().unwrap_or_else(|| home.join(".local/bin")),
                     legacy_database: Some(legacy_state),
-                    local_root: None,
+                    project_root: None,
                     manifest: None,
                 })
             }
-            ScopeKind::Local => {
+            ScopeKind::Project => {
                 if destination.is_some()
                     || environment("EGET_BIN_DIR").is_some()
                     || environment("EGET_BIN").is_some()
                 {
-                    bail!("binary-directory overrides are not allowed in local scope")
+                    bail!("binary-directory overrides are not allowed in project scope")
                 }
-                let local_root = local_root.context(
-                    "local scope requires an eget-packages.txt in an owned directory below HOME",
+                let project_root = project_root.context(
+                    "project scope requires an eget-packages.txt in an owned directory below HOME",
                 )?;
-                let state = local_root.join(".eget");
+                let state = project_root.join(".eget");
                 Ok(Self {
                     kind,
                     package_root: state.clone(),
@@ -150,8 +155,8 @@ impl Scope {
                     lock: state.join("eget.lock"),
                     bin_dir: state.join("bin"),
                     legacy_database: None,
-                    manifest: Some(local_root.join("eget-packages.txt")),
-                    local_root: Some(local_root),
+                    manifest: Some(project_root.join("eget-packages.txt")),
+                    project_root: Some(project_root),
                 })
             }
         }
@@ -191,12 +196,12 @@ impl Scope {
         match self.kind {
             ScopeKind::System => "system scope".into(),
             ScopeKind::User => "user scope".into(),
-            ScopeKind::Local => {
+            ScopeKind::Project => {
                 let root = self
-                    .local_root
+                    .project_root
                     .as_deref()
                     .unwrap_or(self.package_root.as_path());
-                format!("local scope ({})", display_path(root))
+                format!("project scope ({})", display_path(root))
             }
         }
     }
@@ -207,21 +212,21 @@ impl Scope {
 
     #[doc(hidden)]
     pub fn from_paths(package_root: PathBuf, state_root: PathBuf, bin_dir: PathBuf) -> Self {
-        let local_root = package_root.parent().map(Path::to_path_buf);
+        let project_root = package_root.parent().map(Path::to_path_buf);
         Self {
-            kind: ScopeKind::Local,
+            kind: ScopeKind::Project,
             package_root,
             database: state_root.join("eget.sqlite3"),
             lock: state_root.join("eget.lock"),
             bin_dir,
             legacy_database: None,
-            local_root,
+            project_root,
             manifest: None,
         }
     }
 }
 
-fn find_local_root(
+fn find_project_root(
     start: &Path,
     home: &Path,
     effective_uid: u32,
@@ -284,11 +289,11 @@ mod tests {
     fn resolve(
         requested: Option<ScopeKind>,
         effective_uid: u32,
-        local_root: Option<PathBuf>,
+        project_root: Option<PathBuf>,
         values: &[(&str, &str)],
     ) -> Result<Scope> {
         let values = values.iter().copied().collect::<HashMap<_, _>>();
-        Scope::resolve(requested, None, effective_uid, local_root, |name| {
+        Scope::resolve(requested, None, effective_uid, project_root, |name| {
             values.get(name).map(OsString::from)
         })
     }
@@ -313,43 +318,44 @@ mod tests {
     }
 
     #[test]
-    fn local_scope_uses_project_eget_directory() {
-        assert!(resolve(Some(ScopeKind::Local), 1000, None, &[]).is_err());
-        let local = resolve(
-            Some(ScopeKind::Local),
+    fn scope_names_accept_project_without_a_local_alias() {
+        assert_eq!("project".parse::<ScopeKind>().unwrap(), ScopeKind::Project);
+        assert!("local".parse::<ScopeKind>().is_err());
+    }
+
+    #[test]
+    fn project_scope_uses_project_eget_directory() {
+        assert!(resolve(Some(ScopeKind::Project), 1000, None, &[]).is_err());
+        let project = resolve(
+            Some(ScopeKind::Project),
             1000,
             Some(PathBuf::from("/work/project")),
-            &[
-                ("EGET_LOCAL_DATA_DIR", "/old-state"),
-                ("EGET_LOCAL_LOCK_DIR", "/old-lock"),
-                ("EGET_LOCAL_PKG_DIR", "/old-packages"),
-                ("EGET_LOCAL_BIN_DIR", "/old-bin"),
-            ],
+            &[],
         )
         .unwrap();
-        assert_eq!(local.package_root, Path::new("/work/project/.eget"));
+        assert_eq!(project.package_root, Path::new("/work/project/.eget"));
         assert_eq!(
-            local.database,
+            project.database,
             Path::new("/work/project/.eget/eget.sqlite3")
         );
-        assert_eq!(local.lock, Path::new("/work/project/.eget/eget.lock"));
-        assert_eq!(local.bin_dir, Path::new("/work/project/.eget/bin"));
+        assert_eq!(project.lock, Path::new("/work/project/.eget/eget.lock"));
+        assert_eq!(project.bin_dir, Path::new("/work/project/.eget/bin"));
     }
 
     #[test]
     fn automatic_and_explicit_scope_selection_follow_precedence() {
-        let local_root = Some(PathBuf::from("/work/project"));
+        let project_root = Some(PathBuf::from("/work/project"));
         assert_eq!(
-            resolve(None, 1000, local_root.clone(), &[("HOME", "/home/test")])
+            resolve(None, 1000, project_root.clone(), &[("HOME", "/home/test")])
                 .unwrap()
                 .kind,
-            ScopeKind::Local
+            ScopeKind::Project
         );
         assert_eq!(
             resolve(
                 Some(ScopeKind::User),
                 1000,
-                local_root.clone(),
+                project_root.clone(),
                 &[("HOME", "/home/test")],
             )
             .unwrap()
@@ -357,21 +363,21 @@ mod tests {
             ScopeKind::User
         );
         assert_eq!(
-            resolve(None, 0, local_root.clone(), &[]).unwrap().kind,
+            resolve(None, 0, project_root.clone(), &[]).unwrap().kind,
             ScopeKind::System
         );
         assert_eq!(
-            resolve(Some(ScopeKind::Local), 0, local_root, &[])
+            resolve(Some(ScopeKind::Project), 0, project_root, &[])
                 .unwrap()
                 .kind,
-            ScopeKind::Local
+            ScopeKind::Project
         );
     }
 
     #[test]
-    fn local_scope_rejects_binary_directory_overrides() {
+    fn project_scope_rejects_binary_directory_overrides() {
         let scope = Scope::resolve(
-            Some(ScopeKind::Local),
+            Some(ScopeKind::Project),
             None,
             1000,
             Some(PathBuf::from("/work/project")),
@@ -386,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn local_discovery_uses_nearest_marker_and_ignores_home_marker() {
+    fn project_discovery_uses_nearest_marker_and_ignores_home_marker() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         let project = home.join("project");
@@ -396,19 +402,19 @@ mod tests {
         fs::write(project.join("eget-packages.txt"), "").unwrap();
         fs::write(project.join("nested/eget-packages.txt"), "").unwrap();
 
-        let found = find_local_root(&nested, &home, 1000, |_| Ok(1000)).unwrap();
-        assert_eq!(found, Some(project.join("nested")));
+        let found = find_project_root(&nested, &home, 1000, |_| Ok(1000)).unwrap();
+        assert_eq!(found, Some(project.join("nested").canonicalize().unwrap()));
 
         fs::remove_file(project.join("nested/eget-packages.txt")).unwrap();
         fs::remove_file(project.join("eget-packages.txt")).unwrap();
         assert_eq!(
-            find_local_root(&nested, &home, 1000, |_| Ok(1000)).unwrap(),
+            find_project_root(&nested, &home, 1000, |_| Ok(1000)).unwrap(),
             None
         );
     }
 
     #[test]
-    fn local_discovery_stops_before_a_foreign_owned_directory() {
+    fn project_discovery_stops_before_a_foreign_owned_directory() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         let project = temp.path().join("shared/project");
@@ -418,7 +424,7 @@ mod tests {
         fs::write(project.join("eget-packages.txt"), "").unwrap();
         let foreign = project.canonicalize().unwrap();
 
-        let found = find_local_root(&nested, &home, 1000, |path| {
+        let found = find_project_root(&nested, &home, 1000, |path| {
             Ok(if path == foreign { 2000 } else { 1000 })
         })
         .unwrap();
@@ -426,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn local_scope_paths_use_home_relative_or_absolute_display() {
+    fn project_scope_paths_use_home_relative_or_absolute_display() {
         assert_eq!(
             display_path_with_home(
                 Path::new("/home/test/project"),

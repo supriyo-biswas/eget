@@ -6,6 +6,7 @@ use crate::model::{HttpValidators, PackageId, PackageRecord, RenameRule, SourceK
 use crate::policy::Channel;
 use crate::scope::Scope;
 use crate::source::{self, AssetCandidate, ResolvedPackage};
+use crate::template::{self, UrlTemplate};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -86,7 +87,7 @@ impl Installer {
 
     pub fn install_manifest(&self, actions: &InstallOptions) -> Result<u8> {
         let Some(preflight) = self.preflight_manifest()? else {
-            bail!("install requires at least one package outside local scope")
+            bail!("install requires at least one package outside project scope")
         };
         if preflight.entries().next().is_none() {
             return Ok(0);
@@ -94,7 +95,7 @@ impl Installer {
         self.session(|session| {
             let manifest = self
                 .load_manifest()?
-                .context("local scope does not have a package manifest")?;
+                .context("project scope does not have a package manifest")?;
             let entries = manifest.entries().cloned().collect::<Vec<_>>();
             let mut failed = false;
             for entry in entries {
@@ -372,20 +373,14 @@ impl Session<'_> {
     }
 
     fn install(&mut self, input: &str, options: &InstallOptions) -> Result<InstallOutcome> {
-        if options.version_url.is_some() && !input.contains("{{version}}") {
-            bail!("--version-url requires the package URL to contain {{version}}")
-        }
+        let template = UrlTemplate::parse(input, options.version_url.is_some())?;
         let version_check = options
             .version_url
             .as_deref()
             .map(|url| fetch_version(self.client, url))
             .transpose()?;
         let version = version_check.as_ref().map(|(version, _)| version);
-        let concrete_input = if let Some(version) = version {
-            input.replace("{{version}}", version)
-        } else {
-            input.to_owned()
-        };
+        let concrete_input = template.render_current(version.map(String::as_str))?;
         let requested_channel = options.channel.unwrap_or(Channel::Stable);
         let initial = source::resolve_with_store(
             self.client,
@@ -394,6 +389,9 @@ impl Session<'_> {
             requested_channel,
             None,
         )?;
+        if template.is_dynamic() && initial.kind != SourceKind::Direct {
+            bail!("URL templates may only be used with direct package URLs")
+        }
         let installed = self.database.package(&initial.id)?;
 
         if options.ignore_existing
@@ -509,7 +507,7 @@ impl Session<'_> {
                 .map(|package| package.bin_dir.clone())
                 .unwrap_or_else(|| self.scope.bin_dir.clone()),
             pinned,
-            installed_asset_url: if options.version_url.is_some() {
+            installed_asset_url: if template.is_dynamic() {
                 input.to_owned()
             } else {
                 prepared.asset_url.clone()
@@ -589,14 +587,16 @@ impl Session<'_> {
     }
 
     fn probe_direct_update(&self, installed: PackageRecord) -> Result<UpdateProbe> {
+        let template = UrlTemplate::parse(
+            &installed.installed_asset_url,
+            installed.version_check_url.is_some(),
+        )?;
         if let Some(version_url) = &installed.version_check_url {
             let (version, version_validators) = fetch_version(self.client, version_url)?;
             if installed.current_version.as_deref() == Some(&version) {
                 return Ok(UpdateProbe::Unchanged);
             }
-            let concrete = installed
-                .installed_asset_url
-                .replace("{{version}}", &version);
+            let concrete = template.render_current(Some(&version))?;
             let resolved = source::resolve_with_preferences(
                 self.client,
                 &concrete,
@@ -614,9 +614,10 @@ impl Session<'_> {
         if installed.validators.etag.is_none() && installed.validators.last_modified.is_none() {
             return Ok(UpdateProbe::Skipped("no HTTP validators"));
         }
+        let concrete = template.render_current(None)?;
         let response = source::conditional_head(
             self.client,
-            &installed.installed_asset_url,
+            &concrete,
             installed.validators.etag.as_deref(),
             installed.validators.last_modified.as_deref(),
         )?;
@@ -627,7 +628,7 @@ impl Session<'_> {
         }
         let resolved = source::resolve_with_preferences(
             self.client,
-            &installed.installed_asset_url,
+            &concrete,
             Some(SourceKind::Direct),
             Channel::Stable,
             None,
@@ -653,7 +654,7 @@ impl Session<'_> {
         let mut record = update.installed.clone();
         prepared.apply_rename_rules(&record.rename_rules)?;
         record.current_version = update.version.or(update.resolved.tag.clone());
-        record.installed_asset_url = if record.version_check_url.is_some() {
+        record.installed_asset_url = if template::is_dynamic(&record.installed_asset_url) {
             record.installed_asset_url.clone()
         } else {
             prepared.asset_url.clone()
