@@ -107,7 +107,10 @@ fn exec_replaces_eget_and_inherits_arguments_environment_and_working_directory()
     assert_eq!(output.status.code(), Some(37));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        format!("--flag|inherited|{}", working_directory.display())
+        format!(
+            "--flag|inherited|{}",
+            working_directory.canonicalize().unwrap().display()
+        )
     );
     assert!(output.stderr.is_empty());
 }
