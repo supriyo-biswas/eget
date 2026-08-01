@@ -909,7 +909,8 @@ fn find_github_style_release(
     allow_prerelease: bool,
 ) -> Result<GithubRelease> {
     for page in 1..=MAX_RELEASE_PAGES {
-        let endpoint = release_list_endpoint(origin, kind, project, page)?;
+        let tag_filter = (kind == SourceKind::Gitea).then_some(selector).flatten();
+        let endpoint = release_list_endpoint(origin, kind, project, page, tag_filter)?;
         let (releases, has_next): (Vec<GithubRelease>, _) = api_json_page(client, endpoint, kind)?;
         if let Some(release) = releases.into_iter().find(|release| {
             !release.draft
@@ -938,7 +939,7 @@ fn find_gitlab_release(
     selector: &str,
 ) -> Result<GitlabRelease> {
     for page in 1..=MAX_RELEASE_PAGES {
-        let endpoint = release_list_endpoint(origin, SourceKind::Gitlab, project, page)?;
+        let endpoint = release_list_endpoint(origin, SourceKind::Gitlab, project, page, None)?;
         let (releases, has_next): (Vec<GitlabRelease>, _) =
             api_json_page(client, endpoint, SourceKind::Gitlab)?;
         if let Some(release) = releases
@@ -962,6 +963,7 @@ fn release_list_endpoint(
     kind: SourceKind,
     project: &[String],
     page: usize,
+    tag_filter: Option<&str>,
 ) -> Result<Url> {
     let mut url = match kind {
         SourceKind::Github => {
@@ -999,9 +1001,14 @@ fn release_list_endpoint(
     } else {
         "per_page"
     };
-    url.query_pairs_mut()
+    let mut query = url.query_pairs_mut();
+    query
         .append_pair(page_size, &RELEASE_PAGE_SIZE.to_string())
         .append_pair("page", &page.to_string());
+    if let Some(selector) = tag_filter {
+        query.append_pair("tag_filter", &format!("{selector}*"));
+    }
+    drop(query);
     Ok(url)
 }
 
@@ -2230,7 +2237,7 @@ mod tests {
     }
 
     #[test]
-    fn gitea_prefix_resolution_searches_three_pages_with_boundaries() {
+    fn gitea_prefix_resolution_uses_server_filter_and_client_boundaries() {
         let release = |tag: &str, prerelease: bool| {
             format!(
                 r#"[{{"tag_name":"{tag}","draft":false,"prerelease":{prerelease},"assets":[{{"name":"{}","browser_download_url":"https://example.com/asset"}}]}}]"#,
@@ -2241,11 +2248,16 @@ mod tests {
             MockResponse {
                 status: "200 OK",
                 headers: vec![("X-Next-Page", "2")],
-                body: release("gnu-sed2-5.0", false),
+                body: release("GNU-sed-5.0", false),
             },
             MockResponse {
                 status: "200 OK",
                 headers: vec![("X-Next-Page", "3")],
+                body: release("gnu-sed2-5.0", false),
+            },
+            MockResponse {
+                status: "200 OK",
+                headers: vec![("X-Next-Page", "4")],
                 body: release("gnu-sed-5.0-rc1", true),
             },
             MockResponse {
@@ -2267,9 +2279,9 @@ mod tests {
         assert_eq!(package.release_selector.as_deref(), Some("gnu-sed"));
         assert!(!package.automatic_pin);
         let requests = handle.join().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert!(requests[0].contains("/releases?limit=100&page=1"));
-        assert!(requests[2].contains("/releases?limit=100&page=3"));
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].contains("/releases?limit=100&page=1&tag_filter=gnu-sed*"));
+        assert!(requests[3].contains("/releases?limit=100&page=4&tag_filter=gnu-sed*"));
     }
 
     #[test]
@@ -2293,6 +2305,30 @@ mod tests {
         assert_eq!(package.tag.as_deref(), Some("tool-2.0-rc1"));
         assert_eq!(package.channel, Channel::Prerelease);
         assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn gitea_unqualified_prerelease_list_omits_tag_filter() {
+        let (base, handle) = serve(vec![MockResponse {
+            status: "200 OK",
+            headers: vec![],
+            body: format!(
+                r#"[{{"tag_name":"v2.0-rc1","draft":false,"prerelease":true,"assets":[{{"name":"{}","browser_download_url":"https://example.com/asset"}}]}}]"#,
+                platform_asset_name()
+            ),
+        }]);
+        let package = resolve_with_preferences(
+            &client().unwrap(),
+            &format!("{base}/Owner/Repo"),
+            Some(SourceKind::Gitea),
+            Channel::Prerelease,
+            None,
+        )
+        .unwrap();
+        assert_eq!(package.tag.as_deref(), Some("v2.0-rc1"));
+        let requests = handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].contains("tag_filter="));
     }
 
     #[test]

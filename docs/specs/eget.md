@@ -331,7 +331,7 @@ Some forge repos publish releases for more than one distinct artifact family fro
 
 * **GitLab**: list releases newest-first and scan them client-side for the first tag satisfying the selector rule.
 * **GitHub**: neither the releases nor tags listing endpoint accepts a name/prefix filter. List releases newest-first and scan them client-side for the first tag satisfying the selector rule.
-* **Gitea**: its releases and tags REST endpoints likewise have no documented name/prefix filter. List releases newest-first and scan them client-side for the first tag satisfying the selector rule. When the requested channel is `prerelease`, also pass Gitea's `pre-release=true` release-list filter so non-prereleases do not consume the client-side scan.
+* **Gitea**: pass `tag_filter=<selector>*` to the release-list endpoint so versions that support the parameter can reduce the result set server-side. Older versions ignore the unknown parameter and return the unfiltered list. In either case, scan releases newest-first and apply the selector rule client-side because Gitea's filter is case-insensitive and does not enforce the selector boundary. When the requested channel is `prerelease`, also pass Gitea's `pre-release=true` release-list filter so non-prereleases do not consume the client-side scan.
 
 Every paginated release or tag scan requests the forge's maximum supported page size and fetches at most **5 pages**. If no match is found within those 5 pages, installation/update fails rather than silently choosing a tag from another artifact family or scanning an unbounded history.
 
