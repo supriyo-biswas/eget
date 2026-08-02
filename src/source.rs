@@ -24,7 +24,7 @@ use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
-const MAX_API_BODY: u64 = 2 * 1024 * 1024;
+const MAX_API_BODY: u64 = 6 * 1024 * 1024;
 const MAX_PROBE_BODY: u64 = 64 * 1024;
 const MAX_REDIRECTS: usize = 10;
 const RELEASE_PAGE_SIZE: usize = 100;
@@ -116,6 +116,28 @@ impl fmt::Display for SelectorNotFound {
 impl Error for SelectorNotFound {}
 
 #[derive(Debug)]
+pub struct NoStableRelease {
+    pub source: String,
+    pub prerelease_tag: Option<String>,
+}
+
+impl fmt::Display for NoStableRelease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "no stable release available for {}", self.source)?;
+        if let Some(tag) = &self.prerelease_tag {
+            write!(
+                formatter,
+                "; install the latest prerelease with `eget install {}:{tag}`",
+                self.source
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for NoStableRelease {}
+
+#[derive(Debug)]
 pub struct MonorepoLatest {
     pub tag: String,
     pub selector: String,
@@ -159,6 +181,23 @@ enum Platform {
     Linux { arch: HostArch, libc: Option<Libc> },
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Macos { arch: HostArch },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrereleasePolicy {
+    Exclude,
+    Include,
+    Only,
+}
+
+impl PrereleasePolicy {
+    fn accepts(self, prerelease: bool) -> bool {
+        match self {
+            Self::Exclude => !prerelease,
+            Self::Include => true,
+            Self::Only => prerelease,
+        }
+    }
 }
 
 impl Platform {
@@ -768,6 +807,7 @@ fn resolve_forge(
         &project,
         &request,
         channel.allows_prereleases(),
+        &source,
     )?;
     if matches!(request, ReleaseRequest::Latest) {
         selector = selector_for_latest(&tag, project.last().unwrap(), &source)?;
@@ -828,6 +868,7 @@ fn fetch_forge_release(
     project: &[String],
     request: &ReleaseRequest,
     allow_prerelease: bool,
+    source: &str,
 ) -> Result<(String, Vec<AssetCandidate>)> {
     match kind {
         SourceKind::Gitea => {
@@ -838,18 +879,27 @@ fn fetch_forge_release(
                     kind,
                 )?,
                 ReleaseRequest::Latest if !allow_prerelease => {
-                    api_json(client, release_endpoint(origin, kind, project, None)?, kind)?
+                    latest_stable_release(client, origin, kind, project, source)?
                 }
-                ReleaseRequest::Latest => {
-                    find_github_style_release(client, origin, kind, project, None, true)?
-                }
+                ReleaseRequest::Latest => find_github_style_release(
+                    client,
+                    origin,
+                    kind,
+                    project,
+                    None,
+                    PrereleasePolicy::Only,
+                )?,
                 ReleaseRequest::Prefix(selector) => find_github_style_release(
                     client,
                     origin,
                     kind,
                     project,
                     Some(selector),
-                    allow_prerelease,
+                    if allow_prerelease {
+                        PrereleasePolicy::Only
+                    } else {
+                        PrereleasePolicy::Exclude
+                    },
                 )?,
             };
             Ok(github_release_parts(release))
@@ -888,6 +938,36 @@ fn github_release_parts(release: GithubRelease) -> (String, Vec<AssetCandidate>)
     )
 }
 
+fn latest_stable_release(
+    client: &Client,
+    origin: &Url,
+    kind: SourceKind,
+    project: &[String],
+    source: &str,
+) -> Result<GithubRelease> {
+    let endpoint = release_endpoint(origin, kind, project, None)?;
+    let credential_origin = origin_url(&endpoint)?;
+    let mut response = send_get_unchecked(client, endpoint, kind, Some(&credential_origin), true)?;
+    if response.status().is_success() {
+        let body = read_limited(&mut response, MAX_API_BODY, "release API response")?;
+        return serde_json::from_slice(&body).context("decode release API response");
+    }
+    if response.status() != reqwest::StatusCode::NOT_FOUND {
+        let error = response
+            .error_for_status()
+            .expect_err("non-success response has an HTTP error");
+        return Err(error).context("HTTP GET failed");
+    }
+
+    let prerelease =
+        scan_github_style_releases(client, origin, kind, project, None, PrereleasePolicy::Only)?;
+    Err(NoStableRelease {
+        source: source.to_owned(),
+        prerelease_tag: prerelease.map(|release| release.tag_name),
+    }
+    .into())
+}
+
 fn gitlab_release_parts(release: GitlabRelease, origin: &Url) -> (String, Vec<AssetCandidate>) {
     (
         release.tag_name,
@@ -906,22 +986,12 @@ fn find_github_style_release(
     kind: SourceKind,
     project: &[String],
     selector: Option<&str>,
-    allow_prerelease: bool,
+    prerelease_policy: PrereleasePolicy,
 ) -> Result<GithubRelease> {
-    for page in 1..=MAX_RELEASE_PAGES {
-        let tag_filter = (kind == SourceKind::Gitea).then_some(selector).flatten();
-        let endpoint = release_list_endpoint(origin, kind, project, page, tag_filter)?;
-        let (releases, has_next): (Vec<GithubRelease>, _) = api_json_page(client, endpoint, kind)?;
-        if let Some(release) = releases.into_iter().find(|release| {
-            !release.draft
-                && (allow_prerelease || !release.prerelease)
-                && selector.is_none_or(|selector| selector_matches(&release.tag_name, selector))
-        }) {
-            return Ok(release);
-        }
-        if !has_next {
-            break;
-        }
+    let release =
+        scan_github_style_releases(client, origin, kind, project, selector, prerelease_policy)?;
+    if let Some(release) = release {
+        return Ok(release);
     }
     match selector {
         Some(selector) => Err(SelectorNotFound {
@@ -932,6 +1002,39 @@ fn find_github_style_release(
     }
 }
 
+fn scan_github_style_releases(
+    client: &Client,
+    origin: &Url,
+    kind: SourceKind,
+    project: &[String],
+    selector: Option<&str>,
+    prerelease_policy: PrereleasePolicy,
+) -> Result<Option<GithubRelease>> {
+    for page in 1..=MAX_RELEASE_PAGES {
+        let tag_filter = (kind == SourceKind::Gitea).then_some(selector).flatten();
+        let endpoint = release_list_endpoint(
+            origin,
+            kind,
+            project,
+            page,
+            tag_filter,
+            kind == SourceKind::Gitea && prerelease_policy == PrereleasePolicy::Only,
+        )?;
+        let (releases, has_next): (Vec<GithubRelease>, _) = api_json_page(client, endpoint, kind)?;
+        if let Some(release) = releases.into_iter().find(|release| {
+            !release.draft
+                && prerelease_policy.accepts(release.prerelease)
+                && selector.is_none_or(|selector| selector_matches(&release.tag_name, selector))
+        }) {
+            return Ok(Some(release));
+        }
+        if !has_next {
+            break;
+        }
+    }
+    Ok(None)
+}
+
 fn find_gitlab_release(
     client: &Client,
     origin: &Url,
@@ -939,7 +1042,8 @@ fn find_gitlab_release(
     selector: &str,
 ) -> Result<GitlabRelease> {
     for page in 1..=MAX_RELEASE_PAGES {
-        let endpoint = release_list_endpoint(origin, SourceKind::Gitlab, project, page, None)?;
+        let endpoint =
+            release_list_endpoint(origin, SourceKind::Gitlab, project, page, None, false)?;
         let (releases, has_next): (Vec<GitlabRelease>, _) =
             api_json_page(client, endpoint, SourceKind::Gitlab)?;
         if let Some(release) = releases
@@ -964,6 +1068,7 @@ fn release_list_endpoint(
     project: &[String],
     page: usize,
     tag_filter: Option<&str>,
+    prerelease_only: bool,
 ) -> Result<Url> {
     let mut url = match kind {
         SourceKind::Github => {
@@ -1007,6 +1112,9 @@ fn release_list_endpoint(
         .append_pair("page", &page.to_string());
     if let Some(selector) = tag_filter {
         query.append_pair("tag_filter", &format!("{selector}*"));
+    }
+    if prerelease_only {
+        query.append_pair("pre-release", "true");
     }
     drop(query);
     Ok(url)
@@ -1221,21 +1329,28 @@ fn resolve_github_at(
             release_endpoint(api_origin, SourceKind::Github, project, Some(tag))?,
             SourceKind::Github,
         )?,
-        ReleaseRequest::Latest if !allow_prerelease => api_json(
-            client,
-            release_endpoint(api_origin, SourceKind::Github, project, None)?,
-            SourceKind::Github,
-        )?,
-        ReleaseRequest::Latest => {
-            find_github_style_release(client, api_origin, SourceKind::Github, project, None, true)?
+        ReleaseRequest::Latest if !allow_prerelease => {
+            latest_stable_release(client, api_origin, SourceKind::Github, project, source)?
         }
+        ReleaseRequest::Latest => find_github_style_release(
+            client,
+            api_origin,
+            SourceKind::Github,
+            project,
+            None,
+            PrereleasePolicy::Include,
+        )?,
         ReleaseRequest::Prefix(selector) => find_github_style_release(
             client,
             api_origin,
             SourceKind::Github,
             project,
             Some(selector),
-            allow_prerelease,
+            if allow_prerelease {
+                PrereleasePolicy::Include
+            } else {
+                PrereleasePolicy::Exclude
+            },
         )?,
     };
     if matches!(request, ReleaseRequest::Latest) {
@@ -1439,6 +1554,18 @@ fn conditional_get(
 
 fn send_get(
     client: &Client,
+    url: Url,
+    kind: SourceKind,
+    credential_origin: Option<&Url>,
+    api: bool,
+) -> Result<Response> {
+    send_get_unchecked(client, url, kind, credential_origin, api)?
+        .error_for_status()
+        .context("HTTP GET failed")
+}
+
+fn send_get_unchecked(
+    client: &Client,
     mut url: Url,
     kind: SourceKind,
     credential_origin: Option<&Url>,
@@ -1460,7 +1587,7 @@ fn send_get(
         }
         let response = request.send()?;
         if !response.status().is_redirection() {
-            return response.error_for_status().context("HTTP GET failed");
+            return Ok(response);
         }
         if redirect_count == MAX_REDIRECTS {
             bail!("too many HTTP redirects");
@@ -1970,6 +2097,29 @@ mod tests {
         }
     }
 
+    fn github_release_json(tag: &str, draft: bool, prerelease: bool) -> String {
+        format!(
+            r#"{{"tag_name":"{tag}","draft":{draft},"prerelease":{prerelease},"assets":[{{"name":"{}","browser_download_url":"https://example.com/asset"}}]}}"#,
+            platform_asset_name()
+        )
+    }
+
+    fn resolve_mock_github(
+        api_origin: &str,
+        request: ReleaseRequest,
+        channel: Channel,
+    ) -> Result<ResolvedPackage> {
+        resolve_github_at(
+            &client().unwrap(),
+            &Url::parse("https://github.com/").unwrap(),
+            &Url::parse(&format!("{api_origin}/")).unwrap(),
+            &["Owner".into(), "Tool".into()],
+            request,
+            "Owner/Tool",
+            channel,
+        )
+    }
+
     #[test]
     fn known_hosts_and_token_names_follow_contract() {
         assert_eq!(known_forge("gitea.com"), Some(SourceKind::Gitea));
@@ -2290,8 +2440,9 @@ mod tests {
             status: "200 OK",
             headers: vec![],
             body: format!(
-                r#"[{{"tag_name":"tool-2.0-rc1","draft":false,"prerelease":true,"assets":[{{"name":"{}","browser_download_url":"https://example.com/asset"}}]}}]"#,
-                platform_asset_name()
+                "[{},{}]",
+                github_release_json("tool-2.0", false, false),
+                github_release_json("tool-2.0-rc1", false, true)
             ),
         }]);
         let package = resolve_with_preferences(
@@ -2304,7 +2455,10 @@ mod tests {
         .unwrap();
         assert_eq!(package.tag.as_deref(), Some("tool-2.0-rc1"));
         assert_eq!(package.channel, Channel::Prerelease);
-        assert_eq!(handle.join().unwrap().len(), 1);
+        let requests = handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("tag_filter=tool*"));
+        assert!(requests[0].contains("pre-release=true"));
     }
 
     #[test]
@@ -2329,6 +2483,7 @@ mod tests {
         let requests = handle.join().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(!requests[0].contains("tag_filter="));
+        assert!(requests[0].contains("pre-release=true"));
     }
 
     #[test]
@@ -2530,6 +2685,228 @@ mod tests {
         assert_eq!(package.tag.as_deref(), Some("v2.37.1"));
         assert_eq!(package.candidates[0].name, asset);
         assert!(handle.join().unwrap()[0].contains("/repos/direnv/direnv/releases/latest"));
+    }
+
+    #[test]
+    fn github_latest_404_suggests_the_newest_prerelease() {
+        let (base, handle) = serve(vec![
+            MockResponse {
+                status: "404 Not Found",
+                headers: vec![],
+                body: String::new(),
+            },
+            MockResponse {
+                status: "200 OK",
+                headers: vec![],
+                body: format!("[{}]", github_release_json("v2.0.0-rc1", false, true)),
+            },
+        ]);
+        let error =
+            resolve_mock_github(&base, ReleaseRequest::Latest, Channel::Stable).unwrap_err();
+        let no_stable = error.downcast_ref::<NoStableRelease>().unwrap();
+        assert_eq!(no_stable.source, "Owner/Tool");
+        assert_eq!(no_stable.prerelease_tag.as_deref(), Some("v2.0.0-rc1"));
+        assert_eq!(
+            error.to_string(),
+            "no stable release available for Owner/Tool; install the latest prerelease with `eget install Owner/Tool:v2.0.0-rc1`"
+        );
+        let requests = handle.join().unwrap();
+        assert!(requests[0].starts_with("GET /repos/Owner/Tool/releases/latest HTTP/1.1"));
+        assert!(
+            requests[1].starts_with("GET /repos/Owner/Tool/releases?per_page=100&page=1 HTTP/1.1")
+        );
+    }
+
+    #[test]
+    fn github_enterprise_uses_its_api_v3_release_endpoints_for_the_fallback() {
+        let (base, handle) = serve(vec![
+            MockResponse {
+                status: "404 Not Found",
+                headers: vec![],
+                body: String::new(),
+            },
+            MockResponse {
+                status: "200 OK",
+                headers: vec![],
+                body: format!("[{}]", github_release_json("v2.0.0-rc1", false, true)),
+            },
+        ]);
+        let source = format!("{base}/Owner/Tool");
+        let error = resolve_with_preferences(
+            &client().unwrap(),
+            &source,
+            Some(SourceKind::Github),
+            Channel::Stable,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<NoStableRelease>().is_some());
+        let requests = handle.join().unwrap();
+        assert!(requests[0].starts_with("GET /api/v3/repos/Owner/Tool/releases/latest HTTP/1.1"));
+        assert!(
+            requests[1]
+                .starts_with("GET /api/v3/repos/Owner/Tool/releases?per_page=100&page=1 HTTP/1.1")
+        );
+    }
+
+    #[test]
+    fn gitea_latest_404_suggests_the_newest_prerelease() {
+        let (base, handle) = serve(vec![
+            MockResponse {
+                status: "404 Not Found",
+                headers: vec![],
+                body: String::new(),
+            },
+            MockResponse {
+                status: "200 OK",
+                headers: vec![],
+                body: format!("[{}]", github_release_json("v2.0.0-rc1", false, true)),
+            },
+        ]);
+        let source = format!("{base}/Owner/Tool");
+        let error = resolve_with_preferences(
+            &client().unwrap(),
+            &source,
+            Some(SourceKind::Gitea),
+            Channel::Stable,
+            None,
+        )
+        .unwrap_err();
+        let no_stable = error.downcast_ref::<NoStableRelease>().unwrap();
+        assert_eq!(no_stable.source, source);
+        assert_eq!(no_stable.prerelease_tag.as_deref(), Some("v2.0.0-rc1"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("`eget install {source}:v2.0.0-rc1`"))
+        );
+        let requests = handle.join().unwrap();
+        assert!(requests[0].starts_with("GET /api/v1/repos/Owner/Tool/releases/latest HTTP/1.1"));
+        assert!(requests[1].starts_with(
+            "GET /api/v1/repos/Owner/Tool/releases?limit=100&page=1&pre-release=true HTTP/1.1"
+        ));
+    }
+
+    #[test]
+    fn gitea_prerelease_fallback_filters_drafts_and_stable_releases_across_pages() {
+        let first_page = format!(
+            "[{},{}]",
+            github_release_json("v3.0.0", false, false),
+            github_release_json("v3.0.0-rc2", true, true)
+        );
+        let (base, handle) = serve(vec![
+            MockResponse {
+                status: "404 Not Found",
+                headers: vec![],
+                body: String::new(),
+            },
+            MockResponse {
+                status: "200 OK",
+                headers: vec![("X-Next-Page", "2")],
+                body: first_page,
+            },
+            MockResponse {
+                status: "200 OK",
+                headers: vec![],
+                body: format!("[{}]", github_release_json("v3.0.0-rc1", false, true)),
+            },
+        ]);
+        let source = format!("{base}/Owner/Tool");
+        let error = resolve_with_preferences(
+            &client().unwrap(),
+            &source,
+            Some(SourceKind::Gitea),
+            Channel::Stable,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<NoStableRelease>()
+                .unwrap()
+                .prerelease_tag
+                .as_deref(),
+            Some("v3.0.0-rc1")
+        );
+        let requests = handle.join().unwrap();
+        assert!(requests[2].contains("page=2&pre-release=true"));
+    }
+
+    #[test]
+    fn successful_empty_fallback_reports_no_stable_release_without_a_suggestion() {
+        let (base, handle) = serve(vec![
+            MockResponse {
+                status: "404 Not Found",
+                headers: vec![],
+                body: String::new(),
+            },
+            MockResponse {
+                status: "200 OK",
+                headers: vec![],
+                body: "[]".into(),
+            },
+        ]);
+        let error =
+            resolve_mock_github(&base, ReleaseRequest::Latest, Channel::Stable).unwrap_err();
+        let no_stable = error.downcast_ref::<NoStableRelease>().unwrap();
+        assert_eq!(no_stable.prerelease_tag, None);
+        assert_eq!(
+            error.to_string(),
+            "no stable release available for Owner/Tool"
+        );
+        assert_eq!(handle.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failing_release_list_preserves_the_http_error() {
+        let (base, handle) = serve(vec![
+            MockResponse {
+                status: "404 Not Found",
+                headers: vec![],
+                body: String::new(),
+            },
+            MockResponse {
+                status: "403 Forbidden",
+                headers: vec![],
+                body: String::new(),
+            },
+        ]);
+        let error =
+            resolve_mock_github(&base, ReleaseRequest::Latest, Channel::Stable).unwrap_err();
+        assert!(error.downcast_ref::<NoStableRelease>().is_none());
+        assert!(format!("{error:#}").contains("403 Forbidden"));
+        assert_eq!(handle.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn non_404_latest_error_and_exact_tag_404_do_not_list_releases() {
+        let (base, handle) = serve(vec![MockResponse {
+            status: "500 Internal Server Error",
+            headers: vec![],
+            body: String::new(),
+        }]);
+        let error =
+            resolve_mock_github(&base, ReleaseRequest::Latest, Channel::Stable).unwrap_err();
+        assert!(format!("{error:#}").contains("500 Internal Server Error"));
+        assert_eq!(handle.join().unwrap().len(), 1);
+
+        let (base, handle) = serve(vec![MockResponse {
+            status: "404 Not Found",
+            headers: vec![],
+            body: String::new(),
+        }]);
+        let error = resolve_mock_github(
+            &base,
+            ReleaseRequest::Exact {
+                tag: "v1.0.0".into(),
+                selector: None,
+            },
+            Channel::Stable,
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<NoStableRelease>().is_none());
+        assert!(format!("{error:#}").contains("404 Not Found"));
+        assert_eq!(handle.join().unwrap().len(), 1);
     }
 
     #[test]
