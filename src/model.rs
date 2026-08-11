@@ -109,6 +109,16 @@ pub struct HttpValidators {
     pub last_modified: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct AssetPreferences(pub Vec<String>);
+
+impl AssetPreferences {
+    pub fn contains(&self, marker: &str) -> bool {
+        self.0.iter().any(|preference| preference == marker)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageRecord {
     pub id: PackageId,
@@ -120,6 +130,7 @@ pub struct PackageRecord {
     pub bin_dir: PathBuf,
     pub pinned: bool,
     pub installed_asset_url: String,
+    pub asset_preferences: Option<AssetPreferences>,
     pub channel: Option<Channel>,
     pub release_selector: Option<String>,
     pub version_check_url: Option<String>,

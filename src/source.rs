@@ -1,7 +1,7 @@
 use crate::{
     compat::{self, HostArch, HostOs},
     db::Database,
-    model::ProbeKind,
+    model::{AssetPreferences, ProbeKind},
     policy::Channel,
 };
 use anyhow::{Context, Result, bail};
@@ -80,6 +80,12 @@ struct GithubRelease {
 struct GithubAsset {
     name: String,
     browser_download_url: String,
+}
+
+#[derive(Clone, Copy)]
+struct GithubPreferences<'a> {
+    channel: Channel,
+    assets: &'a AssetPreferences,
 }
 
 #[derive(Deserialize)]
@@ -254,6 +260,24 @@ pub fn resolve_with_preferences(
     channel: Channel,
     release_selector: Option<&str>,
 ) -> Result<ResolvedPackage> {
+    resolve_with_asset_preferences(
+        client,
+        input,
+        hint,
+        channel,
+        release_selector,
+        &AssetPreferences::default(),
+    )
+}
+
+pub(crate) fn resolve_with_asset_preferences(
+    client: &Client,
+    input: &str,
+    hint: Option<SourceKind>,
+    channel: Channel,
+    release_selector: Option<&str>,
+    asset_preferences: &AssetPreferences,
+) -> Result<ResolvedPackage> {
     if matches!(hint, None | Some(SourceKind::Github))
         && let Some((owner, repo, tag)) = parse_repo(input)
     {
@@ -262,7 +286,15 @@ pub fn resolve_with_preferences(
             || release_request(tag),
             |selector| ReleaseRequest::Prefix(selector.to_owned()),
         );
-        return resolve_github(client, owner, repo, request, &source, channel);
+        return resolve_github(
+            client,
+            owner,
+            repo,
+            request,
+            &source,
+            channel,
+            asset_preferences,
+        );
     }
 
     let url = normalized_url(input)?;
@@ -278,12 +310,27 @@ pub fn resolve_with_preferences(
     };
 
     if kind == SourceKind::Github {
-        return resolve_github_url(client, &url, input, channel, release_selector);
+        return resolve_github_url(
+            client,
+            &url,
+            input,
+            channel,
+            release_selector,
+            asset_preferences,
+        );
     }
     if matches!(kind, SourceKind::Gitea | SourceKind::Gitlab) {
         let parsed = parse_forge_url(&url, kind)
             .with_context(|| format!("invalid {} URL: {input}", kind.as_str()))?;
-        return resolve_forge(client, &url, parsed, kind, channel, release_selector);
+        return resolve_forge(
+            client,
+            &url,
+            parsed,
+            kind,
+            channel,
+            release_selector,
+            asset_preferences,
+        );
     }
 
     let app = direct_app(&url);
@@ -319,8 +366,33 @@ pub fn resolve_with_store(
     channel: Channel,
     release_selector: Option<&str>,
 ) -> Result<ResolvedPackage> {
+    resolve_with_store_and_asset_preferences(
+        client,
+        database,
+        input,
+        channel,
+        release_selector,
+        &AssetPreferences::default(),
+    )
+}
+
+pub(crate) fn resolve_with_store_and_asset_preferences(
+    client: &Client,
+    database: &Database,
+    input: &str,
+    channel: Channel,
+    release_selector: Option<&str>,
+    asset_preferences: &AssetPreferences,
+) -> Result<ResolvedPackage> {
     if parse_repo(input).is_some() {
-        return resolve_with_preferences(client, input, None, channel, release_selector);
+        return resolve_with_asset_preferences(
+            client,
+            input,
+            None,
+            channel,
+            release_selector,
+            asset_preferences,
+        );
     }
     let url = normalized_url(input)?;
     let host = url.host_str().context("URL has no host")?;
@@ -351,7 +423,14 @@ pub fn resolve_with_store(
             ProbeKind::Unknown => SourceKind::Direct,
         }
     };
-    resolve_with_preferences(client, input, Some(hint), channel, release_selector)
+    resolve_with_asset_preferences(
+        client,
+        input,
+        Some(hint),
+        channel,
+        release_selector,
+        asset_preferences,
+    )
 }
 
 pub fn package_identity_hint(
@@ -750,6 +829,7 @@ fn resolve_forge(
     kind: SourceKind,
     channel: Channel,
     release_selector: Option<&str>,
+    asset_preferences: &AssetPreferences,
 ) -> Result<ResolvedPackage> {
     if kind == SourceKind::Gitlab && channel == Channel::Prerelease {
         bail!("GitLab does not support the prerelease channel")
@@ -812,7 +892,7 @@ fn resolve_forge(
     if matches!(request, ReleaseRequest::Latest) {
         selector = selector_for_latest(&tag, project.last().unwrap(), &source)?;
     }
-    filter_and_sort_assets(&mut candidates, &tag)?;
+    filter_and_sort_assets(&mut candidates, &tag, asset_preferences)?;
     if candidates.is_empty() {
         bail!(
             "no supported release assets found for {}",
@@ -1188,6 +1268,7 @@ fn resolve_github_url(
     original: &str,
     channel: Channel,
     release_selector: Option<&str>,
+    asset_preferences: &AssetPreferences,
 ) -> Result<ResolvedPackage> {
     let web_origin = origin_url(url)?;
     let host = web_origin.host_str().context("GitHub URL has no host")?;
@@ -1253,7 +1334,10 @@ fn resolve_github_url(
         &project,
         request,
         &source,
-        channel,
+        GithubPreferences {
+            channel,
+            assets: asset_preferences,
+        },
     )
 }
 
@@ -1291,6 +1375,7 @@ fn resolve_github(
     request: ReleaseRequest,
     source: &str,
     channel: Channel,
+    asset_preferences: &AssetPreferences,
 ) -> Result<ResolvedPackage> {
     let project = [owner.to_owned(), repo.to_owned()];
     resolve_github_at(
@@ -1300,7 +1385,10 @@ fn resolve_github(
         &project,
         request,
         source,
-        channel,
+        GithubPreferences {
+            channel,
+            assets: asset_preferences,
+        },
     )
 }
 
@@ -1311,12 +1399,12 @@ fn resolve_github_at(
     project: &[String],
     request: ReleaseRequest,
     source: &str,
-    channel: Channel,
+    preferences: GithubPreferences<'_>,
 ) -> Result<ResolvedPackage> {
     let [owner, repo] = project else {
         bail!("invalid GitHub project path")
     };
-    let allow_prerelease = channel.allows_prereleases();
+    let allow_prerelease = preferences.channel.allows_prereleases();
     let pinned = matches!(request, ReleaseRequest::Exact { .. });
     let mut selector = match &request {
         ReleaseRequest::Prefix(selector) => Some(selector.clone()),
@@ -1364,7 +1452,7 @@ fn resolve_github_at(
             url: asset.browser_download_url,
         })
         .collect::<Vec<_>>();
-    filter_and_sort_assets(&mut candidates, &release.tag_name)?;
+    filter_and_sort_assets(&mut candidates, &release.tag_name, preferences.assets)?;
     if candidates.is_empty() {
         bail!("no supported release assets found for {owner}/{repo}");
     }
@@ -1381,7 +1469,7 @@ fn resolve_github_at(
         tag: Some(release.tag_name),
         automatic_pin: pinned,
         pinned,
-        channel,
+        channel: preferences.channel,
         release_selector: selector,
         forge_origin: Some(web_origin.to_string()),
         candidates,
@@ -1745,11 +1833,38 @@ fn url_asset_name(url: &Url, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
-fn filter_and_sort_assets(candidates: &mut Vec<AssetCandidate>, tag: &str) -> Result<()> {
+fn filter_and_sort_assets(
+    candidates: &mut Vec<AssetCandidate>,
+    tag: &str,
+    asset_preferences: &AssetPreferences,
+) -> Result<()> {
     let platform = current_platform()?;
     candidates.retain(|candidate| supported_asset(&candidate.name, tag, platform));
-    candidates.sort_by_key(|candidate| Reverse(asset_score(&candidate.name, platform)));
+    sort_assets(candidates, platform, asset_preferences);
     Ok(())
+}
+
+pub(crate) fn rerank_assets(
+    package: &mut ResolvedPackage,
+    asset_preferences: &AssetPreferences,
+) -> Result<()> {
+    let platform = current_platform()?;
+    sort_assets(&mut package.candidates, platform, asset_preferences);
+    Ok(())
+}
+
+fn sort_assets(
+    candidates: &mut [AssetCandidate],
+    platform: Platform,
+    asset_preferences: &AssetPreferences,
+) {
+    candidates.sort_by_key(|candidate| {
+        Reverse(asset_score_with_preferences(
+            &candidate.name,
+            platform,
+            asset_preferences,
+        ))
+    });
 }
 
 const ARCHIVE_SUFFIXES: &[&str] = &[
@@ -1787,11 +1902,29 @@ fn supported_asset(name: &str, tag: &str, platform: Platform) -> bool {
         || Path::new(&name).extension().is_none()
 }
 
+#[cfg(test)]
 fn asset_score(name: &str, platform: Platform) -> i32 {
+    asset_score_with_preferences(name, platform, &AssetPreferences::default())
+}
+
+fn asset_score_with_preferences(
+    name: &str,
+    platform: Platform,
+    asset_preferences: &AssetPreferences,
+) -> i32 {
     let name = name.to_ascii_lowercase();
     let mut score = i32::from(ARCHIVE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))) * 10;
     match platform {
         Platform::Linux { libc, .. } => {
+            for marker in ["gtk", "qt"] {
+                if word_match(&name, marker) {
+                    score += if asset_preferences.contains(marker) {
+                        1
+                    } else {
+                        -1
+                    };
+                }
+            }
             if marker_match(&name, "static") {
                 score += 5;
             }
@@ -1922,6 +2055,14 @@ fn terminal_marker_pair(name: &str, first: &str, second: &str) -> bool {
 fn marker_match(name: &str, marker: &str) -> bool {
     name.match_indices(marker)
         .any(|(index, _)| index == 0 || !name.as_bytes()[index - 1].is_ascii_alphanumeric())
+}
+
+fn word_match(name: &str, marker: &str) -> bool {
+    name.match_indices(marker).any(|(index, matched)| {
+        (index == 0 || !name.as_bytes()[index - 1].is_ascii_alphanumeric())
+            && (index + matched.len() == name.len()
+                || !name.as_bytes()[index + matched.len()].is_ascii_alphanumeric())
+    })
 }
 
 fn normalized_owner(host: &str) -> String {
@@ -2116,7 +2257,10 @@ mod tests {
             &["Owner".into(), "Tool".into()],
             request,
             "Owner/Tool",
-            channel,
+            GithubPreferences {
+                channel,
+                assets: &AssetPreferences::default(),
+            },
         )
     }
 
@@ -2260,6 +2404,7 @@ mod tests {
                 github.as_str(),
                 Channel::Stable,
                 None,
+                &AssetPreferences::default(),
             )
             .is_err()
         );
@@ -2678,7 +2823,10 @@ mod tests {
             &["direnv".into(), "direnv".into()],
             ReleaseRequest::Latest,
             "github.com/direnv/direnv",
-            Channel::Stable,
+            GithubPreferences {
+                channel: Channel::Stable,
+                assets: &AssetPreferences::default(),
+            },
         )
         .unwrap();
 
@@ -2926,6 +3074,76 @@ mod tests {
             tag,
             platform
         ));
+    }
+
+    #[test]
+    fn linux_desktop_preferences_rank_monopass_style_assets() {
+        let platform = Platform::Linux {
+            arch: HostArch::X86_64,
+            libc: Some(Libc::Glibc),
+        };
+        let candidates = || {
+            [
+                "monopass-linux-x86_64-gtk.tar.gz",
+                "monopass-linux-x86_64-qt.tar.gz",
+                "monopass-linux-x86_64.tar.gz",
+            ]
+            .into_iter()
+            .map(|name| AssetCandidate {
+                name: name.into(),
+                url: format!("https://example.com/{name}"),
+            })
+            .collect::<Vec<_>>()
+        };
+
+        let mut gtk = candidates();
+        sort_assets(&mut gtk, platform, &AssetPreferences(vec!["gtk".into()]));
+        assert_eq!(
+            gtk.iter()
+                .map(|asset| asset.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "monopass-linux-x86_64-gtk.tar.gz",
+                "monopass-linux-x86_64.tar.gz",
+                "monopass-linux-x86_64-qt.tar.gz",
+            ]
+        );
+
+        let mut qt = candidates();
+        sort_assets(&mut qt, platform, &AssetPreferences(vec!["qt".into()]));
+        assert_eq!(
+            qt.iter()
+                .map(|asset| asset.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "monopass-linux-x86_64-qt.tar.gz",
+                "monopass-linux-x86_64.tar.gz",
+                "monopass-linux-x86_64-gtk.tar.gz",
+            ]
+        );
+
+        let mut unknown = candidates();
+        sort_assets(&mut unknown, platform, &AssetPreferences::default());
+        assert_eq!(unknown[0].name, "monopass-linux-x86_64.tar.gz");
+        assert!(supported_asset(&unknown[1].name, "v1", platform));
+        assert!(supported_asset(&unknown[2].name, "v1", platform));
+    }
+
+    #[test]
+    fn desktop_markers_are_boundary_aware_and_do_not_override_libc() {
+        let platform = Platform::Linux {
+            arch: HostArch::X86_64,
+            libc: Some(Libc::Glibc),
+        };
+        let gtk = AssetPreferences(vec!["gtk".into()]);
+        assert_eq!(
+            asset_score_with_preferences("tool-linux-amd64-gtk4.tar.gz", platform, &gtk),
+            asset_score("tool-linux-amd64.tar.gz", platform)
+        );
+        assert!(
+            asset_score_with_preferences("tool-linux-amd64-glibc.tar.gz", platform, &gtk)
+                > asset_score_with_preferences("tool-linux-amd64-musl-gtk.tar.gz", platform, &gtk,)
+        );
     }
 
     #[test]

@@ -52,6 +52,7 @@ impl ExecFixture {
             bin_dir: bin_dir.to_owned(),
             pinned: true,
             installed_asset_url: "https://example.com/tool".into(),
+            asset_preferences: None,
             channel: None,
             release_selector: None,
             version_check_url: None,

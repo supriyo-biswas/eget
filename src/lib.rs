@@ -2,6 +2,7 @@ pub mod archive;
 pub mod cli;
 pub mod compat;
 pub mod db;
+mod desktop;
 pub mod installer;
 pub mod manifest;
 pub mod model;

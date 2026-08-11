@@ -94,6 +94,7 @@ fn direct_package_round_trip_uses_new_schema_and_managed_symlink() {
     assert_eq!(packages[0].current_version, None);
     assert_eq!(packages[0].source_kind.as_str(), "direct");
     assert!(packages[0].pinned);
+    assert!(packages[0].asset_preferences.is_some());
     assert_eq!(packages[0].binaries, ["tool"]);
     assert_eq!(
         fs::read_to_string(scope.bin_dir.join("tool")).unwrap(),

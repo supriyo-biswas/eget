@@ -179,11 +179,16 @@ CREATE TABLE packages (
     rename_rules TEXT NOT NULL,
     -- when it was installed/last updated
     installed_at TEXT NOT NULL, -- DATETIME, ISO-8601
-    updated_at TEXT -- DATETIME, ISO-8601
+    updated_at TEXT, -- DATETIME, ISO-8601
+    -- JSON list<string> of automatic asset-name preferences captured during installation;
+    -- null only for a package migrated from schema version 1 which has not yet been updated
+    asset_preferences TEXT
 ) STRICT, WITHOUT ROWID;
 ```
 
 `id` is the sole package primary key. There is one row per installed package, and version history is not retained beyond `current_version`.
+
+`asset_preferences` is set automatically and has no command-line or manifest control. New installations store `[]`, `["gtk"]`, or `["qt"]`. A package migrated from schema version 1 retains `NULL` until its next successful installation or update, which detects and records the current preference. Once non-null, the value is preserved across targeted updates and `--reinstall`; uninstalling and freshly installing the package detects it again.
 
 ### Binaries table
 
@@ -216,7 +221,7 @@ A cached row expires after **12 hours** (currently a hardcoded constant, not use
 
 ### Schema compatibility and reset
 
-The schema above is recognized by its exact `packages` column set and validated migration history. An empty database is initialized with all four tables and migration 1 in one transaction. A database with an unrecognized shape is rejected and is never deleted automatically.
+The schema above is recognized by its exact `packages` column set and validated migration history. Migration IDs are contiguous: migration 1 creates the original tables and migration 2 adds `packages.asset_preferences`. An empty database is initialized with all four tables and both migrations in one transaction. A version-1 database is upgraded transactionally without changing existing package metadata; its existing package rows receive `NULL` asset preferences. A database with an unrecognized shape or schema/history mismatch is rejected and is never deleted automatically.
 
 One pre-schema layout is recognized for destructive cleanup: a `packages` table containing `source_url`, `resolved_url`, `release_tag`, and `install_dir`, together with a `links` table. Its tracked package directories and links are not imported. Before deleting that database, `eget` removes only links that are still symlinks resolving beneath their recorded package directory and only package directories whose canonical paths are strict descendants of the active package root. Modified/unowned links are preserved, and an out-of-root package path aborts the reset. The database, WAL, and shared-memory files are removed only after those safety checks and filesystem cleanup succeed.
 
@@ -361,6 +366,9 @@ Given a resolved package ID, source kind, and downloadable asset URL (from the p
    * Add 10 points for a supported archive suffix.
    * On Linux, add 5 points for a `static` marker.
    * When the host libc is known, add 20 points for the matching libc (`glibc`/`gnu` or `musl`) and subtract 1 point for the incompatible libc. An unmarked build therefore ranks above an explicitly incompatible one.
+   * On Linux, detect a desktop toolkit from `XDG_CURRENT_DESKTOP`, falling back to `DESKTOP_SESSION` when the first value is absent or unrecognized. Matching is case-insensitive and recognizes colon-separated identifiers. GNOME/Ubuntu, Unity, Cinnamon, MATE, Xfce, LXDE, Budgie, and Pantheon select GTK; KDE/Plasma and LXQt select Qt. Unknown or conflicting identifiers select neither.
+   * For asset-name words matched at non-alphanumeric boundaries, add 1 point to the detected `gtk` or `qt` marker and subtract 1 point from the other marker. With no detected toolkit, subtract 1 point from either marker. Thus otherwise-equivalent candidates rank as matching toolkit, unmarked, then non-matching toolkit, while every variant remains eligible as a fallback.
+   * Use the package's persisted `asset_preferences` during updates and reinstalls. For a migrated package whose preference is still null, detect it for the next attempted installation and persist it only after that installation succeeds.
    * Linux-specific libc and static markers do not affect macOS ranking.
    Candidates are attempted in descending score order until one yields at least one compatible executable. If all candidates fail, installation reports the failure associated with each candidate.
 2. **Idempotency / re-install / update semantics:**

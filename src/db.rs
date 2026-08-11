@@ -1,4 +1,6 @@
-use crate::model::{HttpValidators, PackageId, PackageRecord, ProbeKind, RenameRule, SourceKind};
+use crate::model::{
+    AssetPreferences, HttpValidators, PackageId, PackageRecord, ProbeKind, RenameRule, SourceKind,
+};
 use crate::policy::Channel;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -7,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-const LATEST_MIGRATION: i64 = 1;
+const LATEST_MIGRATION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE migrations (
@@ -32,7 +34,8 @@ CREATE TABLE packages (
     last_modified TEXT,
     rename_rules TEXT NOT NULL,
     installed_at TEXT NOT NULL,
-    updated_at TEXT
+    updated_at TEXT,
+    asset_preferences TEXT
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE binaries (
@@ -48,6 +51,7 @@ CREATE TABLE source_probe_cache (
 ) STRICT, WITHOUT ROWID;
 
 INSERT INTO migrations(id, state) VALUES (1, 1);
+INSERT INTO migrations(id, state) VALUES (2, 1);
 "#;
 
 pub struct Database {
@@ -195,8 +199,8 @@ pub fn replace_package(transaction: &Transaction<'_>, package: &PackageRecord) -
         "INSERT INTO packages(
             id,current_version,owner,app,source_kind,installation_dir,bin_dir,pinned,
             installed_asset_url,channel,release_selector,version_check_url,etag,last_modified,
-            rename_rules,installed_at,updated_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            rename_rules,installed_at,updated_at,asset_preferences
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
         params![
             package.id.as_str(),
             package.current_version,
@@ -215,6 +219,11 @@ pub fn replace_package(transaction: &Transaction<'_>, package: &PackageRecord) -
             serde_json::to_string(&package.rename_rules)?,
             package.installed_at,
             package.updated_at,
+            package
+                .asset_preferences
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
         ],
     )?;
     for binary in &package.binaries {
@@ -258,15 +267,17 @@ pub fn mark_package(
     Ok(())
 }
 
-const PACKAGE_COLUMNS: &str = "id,current_version,owner,app,source_kind,installation_dir,bin_dir,pinned,installed_asset_url,channel,release_selector,version_check_url,etag,last_modified,rename_rules,installed_at,updated_at";
-const PACKAGE_SELECT_BY_ID: &str = "SELECT id,current_version,owner,app,source_kind,installation_dir,bin_dir,pinned,installed_asset_url,channel,release_selector,version_check_url,etag,last_modified,rename_rules,installed_at,updated_at FROM packages WHERE id=?1";
-const PACKAGE_SELECT_ALL: &str = "SELECT id,current_version,owner,app,source_kind,installation_dir,bin_dir,pinned,installed_asset_url,channel,release_selector,version_check_url,etag,last_modified,rename_rules,installed_at,updated_at FROM packages ORDER BY id";
+const PACKAGE_COLUMNS_V1: &str = "id,current_version,owner,app,source_kind,installation_dir,bin_dir,pinned,installed_asset_url,channel,release_selector,version_check_url,etag,last_modified,rename_rules,installed_at,updated_at";
+const PACKAGE_COLUMNS: &str = "id,current_version,owner,app,source_kind,installation_dir,bin_dir,pinned,installed_asset_url,channel,release_selector,version_check_url,etag,last_modified,rename_rules,installed_at,updated_at,asset_preferences";
+const PACKAGE_SELECT_BY_ID: &str = "SELECT id,current_version,owner,app,source_kind,installation_dir,bin_dir,pinned,installed_asset_url,channel,release_selector,version_check_url,etag,last_modified,rename_rules,installed_at,updated_at,asset_preferences FROM packages WHERE id=?1";
+const PACKAGE_SELECT_ALL: &str = "SELECT id,current_version,owner,app,source_kind,installation_dir,bin_dir,pinned,installed_asset_url,channel,release_selector,version_check_url,etag,last_modified,rename_rules,installed_at,updated_at,asset_preferences FROM packages ORDER BY id";
 
 fn row_package(row: &rusqlite::Row<'_>) -> rusqlite::Result<PackageRecord> {
     let id: String = row.get(0)?;
     let source_kind: String = row.get(4)?;
     let channel: Option<String> = row.get(9)?;
     let rename_rules: String = row.get(14)?;
+    let asset_preferences: Option<String> = row.get(17)?;
     Ok(PackageRecord {
         id: PackageId::parse(id).map_err(sql_conversion)?,
         current_version: row.get(1)?,
@@ -277,6 +288,9 @@ fn row_package(row: &rusqlite::Row<'_>) -> rusqlite::Result<PackageRecord> {
         bin_dir: PathBuf::from(row.get::<_, String>(6)?),
         pinned: row.get(7)?,
         installed_asset_url: row.get(8)?,
+        asset_preferences: asset_preferences
+            .map(|value| serde_json::from_str::<AssetPreferences>(&value).map_err(sql_conversion))
+            .transpose()?,
         channel: channel
             .map(|value| value.parse().map_err(sql_conversion))
             .transpose()?,
@@ -323,14 +337,28 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         bail!("database migration is newer than this eget supports")
     }
     let invalid_rows: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM migrations WHERE id != ?1 OR state != 1",
+        "SELECT COUNT(*) FROM migrations WHERE id < 1 OR id > ?1 OR state != 1",
         [LATEST_MIGRATION],
         |row| row.get(0),
     )?;
     let row_count: i64 =
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| row.get(0))?;
-    if maximum != Some(LATEST_MIGRATION) || row_count != 1 || invalid_rows != 0 {
+    let Some(maximum) = maximum else {
         bail!("database has incomplete migration history")
+    };
+    if row_count != maximum || invalid_rows != 0 {
+        bail!("database has incomplete migration history")
+    }
+    let has_asset_preferences =
+        table_columns(connection, "packages")? == PACKAGE_COLUMNS.split(',').collect::<Vec<_>>();
+    if (maximum == 1 && has_asset_preferences) || (maximum == 2 && !has_asset_preferences) {
+        bail!("database schema does not match migration history")
+    }
+    if maximum == 1 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("ALTER TABLE packages ADD COLUMN asset_preferences TEXT", [])?;
+        transaction.execute("INSERT INTO migrations(id,state) VALUES(2,1)", [])?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -353,7 +381,9 @@ fn schema_kind(path: &Path) -> Result<SchemaKind> {
         });
     }
     let package_columns = table_columns(&connection, "packages")?;
-    if package_columns == PACKAGE_COLUMNS.split(',').collect::<Vec<_>>() {
+    if package_columns == PACKAGE_COLUMNS.split(',').collect::<Vec<_>>()
+        || package_columns == PACKAGE_COLUMNS_V1.split(',').collect::<Vec<_>>()
+    {
         return Ok(SchemaKind::Current);
     }
     let legacy_columns = [
@@ -482,6 +512,7 @@ mod tests {
             bin_dir: root.join("bin"),
             pinned: false,
             installed_asset_url: "https://example.com/tool".into(),
+            asset_preferences: Some(AssetPreferences(vec!["gtk".into()])),
             channel: None,
             release_selector: None,
             version_check_url: None,
@@ -531,6 +562,58 @@ mod tests {
             database.probe("forge.example").unwrap(),
             Some((ProbeKind::Gitea, 42))
         );
+    }
+
+    #[test]
+    fn migrates_version_one_packages_with_uninitialized_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("eget.sqlite3");
+        let mut database = Database::open(&path, temp.path()).unwrap();
+        let package = sample(temp.path());
+        let transaction = database.transaction().unwrap();
+        replace_package(&transaction, &package).unwrap();
+        transaction.commit().unwrap();
+        database
+            .connection
+            .execute("DELETE FROM migrations WHERE id=2", [])
+            .unwrap();
+        database
+            .connection
+            .execute("ALTER TABLE packages DROP COLUMN asset_preferences", [])
+            .unwrap();
+        drop(database);
+
+        let database = Database::open(&path, temp.path()).unwrap();
+        let migrated = database.package(package.id.as_str()).unwrap().unwrap();
+        assert_eq!(migrated.asset_preferences, None);
+        assert_eq!(migrated.binaries, package.binaries);
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM migrations WHERE state=1", [], |row| {
+                    row.get::<_, i64>(0)
+                },)
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_asset_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut database = Database::open(&temp.path().join("eget.sqlite3"), temp.path()).unwrap();
+        let package = sample(temp.path());
+        let transaction = database.transaction().unwrap();
+        replace_package(&transaction, &package).unwrap();
+        transaction.commit().unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE packages SET asset_preferences='{' WHERE id=?1",
+                [package.id.as_str()],
+            )
+            .unwrap();
+        assert!(database.package(package.id.as_str()).is_err());
     }
 
     #[test]
@@ -593,7 +676,7 @@ mod tests {
         let database = Database::open(&future, temp.path()).unwrap();
         database
             .connection
-            .execute("INSERT INTO migrations VALUES(2,1)", [])
+            .execute("INSERT INTO migrations VALUES(3,1)", [])
             .unwrap();
         drop(database);
         assert!(Database::open(&future, temp.path()).is_err());

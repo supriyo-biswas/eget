@@ -2,7 +2,9 @@ use crate::archive::{self, Format};
 use crate::compat;
 use crate::db::{self, Database};
 use crate::manifest::{Entry, Manifest};
-use crate::model::{HttpValidators, PackageId, PackageRecord, RenameRule, SourceKind};
+use crate::model::{
+    AssetPreferences, HttpValidators, PackageId, PackageRecord, RenameRule, SourceKind,
+};
 use crate::policy::Channel;
 use crate::scope::Scope;
 use crate::source::{self, AssetCandidate, ResolvedPackage};
@@ -382,17 +384,22 @@ impl Session<'_> {
         let version = version_check.as_ref().map(|(version, _)| version);
         let concrete_input = template.render_current(version.map(String::as_str))?;
         let requested_channel = options.channel.unwrap_or(Channel::Stable);
-        let initial = source::resolve_with_store(
+        let detected_asset_preferences = crate::desktop::asset_preferences();
+        let mut initial = source::resolve_with_store_and_asset_preferences(
             self.client,
             &self.database,
             &concrete_input,
             requested_channel,
             None,
+            &detected_asset_preferences,
         )?;
         if template.is_dynamic() && initial.kind != SourceKind::Direct {
             bail!("URL templates may only be used with direct package URLs")
         }
         let installed = self.database.package(&initial.id)?;
+        let asset_preferences =
+            effective_asset_preferences(installed.as_ref(), detected_asset_preferences);
+        source::rerank_assets(&mut initial, &asset_preferences)?;
 
         if options.ignore_existing
             && let Some(record) = &installed
@@ -419,12 +426,13 @@ impl Session<'_> {
                         record: installed.clone(),
                     });
                 }
-                source::resolve_with_store(
+                source::resolve_with_store_and_asset_preferences(
                     self.client,
                     &self.database,
                     &concrete_input,
                     installed.channel.unwrap_or(Channel::Stable),
                     installed.release_selector.as_deref(),
+                    &asset_preferences,
                 )?
             } else {
                 initial
@@ -512,6 +520,7 @@ impl Session<'_> {
             } else {
                 prepared.asset_url.clone()
             },
+            asset_preferences: Some(asset_preferences),
             channel,
             release_selector: resolved.release_selector.clone(),
             version_check_url,
@@ -565,12 +574,17 @@ impl Session<'_> {
             SourceKind::Direct => self.probe_direct_update(installed),
             SourceKind::Github | SourceKind::Gitlab | SourceKind::Gitea => {
                 let source = forge_source(&installed);
-                let resolved = source::resolve_with_store(
+                let asset_preferences = effective_asset_preferences(
+                    Some(&installed),
+                    crate::desktop::asset_preferences(),
+                );
+                let resolved = source::resolve_with_store_and_asset_preferences(
                     self.client,
                     &self.database,
                     &source,
                     installed.channel.unwrap_or(Channel::Stable),
                     installed.release_selector.as_deref(),
+                    &asset_preferences,
                 )?;
                 if resolved.tag == installed.current_version {
                     Ok(UpdateProbe::Unchanged)
@@ -578,6 +592,7 @@ impl Session<'_> {
                     Ok(UpdateProbe::Available(Box::new(PendingUpdate {
                         installed,
                         resolved,
+                        asset_preferences,
                         version: None,
                         version_validators: None,
                     })))
@@ -587,6 +602,8 @@ impl Session<'_> {
     }
 
     fn probe_direct_update(&self, installed: PackageRecord) -> Result<UpdateProbe> {
+        let asset_preferences =
+            effective_asset_preferences(Some(&installed), crate::desktop::asset_preferences());
         let template = UrlTemplate::parse(
             &installed.installed_asset_url,
             installed.version_check_url.is_some(),
@@ -597,16 +614,18 @@ impl Session<'_> {
                 return Ok(UpdateProbe::Unchanged);
             }
             let concrete = template.render_current(Some(&version))?;
-            let resolved = source::resolve_with_preferences(
+            let resolved = source::resolve_with_asset_preferences(
                 self.client,
                 &concrete,
                 Some(SourceKind::Direct),
                 Channel::Stable,
                 None,
+                &asset_preferences,
             )?;
             return Ok(UpdateProbe::Available(Box::new(PendingUpdate {
                 installed,
                 resolved,
+                asset_preferences,
                 version: Some(version),
                 version_validators: Some(version_validators),
             })));
@@ -626,16 +645,18 @@ impl Session<'_> {
         {
             return Ok(UpdateProbe::Unchanged);
         }
-        let resolved = source::resolve_with_preferences(
+        let resolved = source::resolve_with_asset_preferences(
             self.client,
             &concrete,
             Some(SourceKind::Direct),
             Channel::Stable,
             None,
+            &asset_preferences,
         )?;
         Ok(UpdateProbe::Available(Box::new(PendingUpdate {
             installed,
             resolved,
+            asset_preferences,
             version: None,
             version_validators: None,
         })))
@@ -662,6 +683,7 @@ impl Session<'_> {
         record.validators = update
             .version_validators
             .unwrap_or_else(|| prepared.validators.clone());
+        record.asset_preferences = Some(update.asset_preferences);
         record.updated_at = Some(now);
         record.binaries = prepared.binary_names();
         self.activate(prepared, Some(&update.installed), record, false)?;
@@ -816,9 +838,19 @@ fn installed_manifest_input(input: &str, package: &PackageRecord) -> String {
     }
 }
 
+fn effective_asset_preferences(
+    installed: Option<&PackageRecord>,
+    detected: AssetPreferences,
+) -> AssetPreferences {
+    installed
+        .and_then(|package| package.asset_preferences.clone())
+        .unwrap_or(detected)
+}
+
 struct PendingUpdate {
     installed: PackageRecord,
     resolved: ResolvedPackage,
+    asset_preferences: AssetPreferences,
     version: Option<String>,
     version_validators: Option<HttpValidators>,
 }
@@ -1306,6 +1338,7 @@ mod tests {
             bin_dir: "/tmp/bin".into(),
             pinned: false,
             installed_asset_url: "https://example.com/tool".into(),
+            asset_preferences: None,
             channel: None,
             release_selector: None,
             version_check_url: None,
@@ -1318,6 +1351,45 @@ mod tests {
         assert_eq!(
             format_package(&record),
             "example.com/tool\t-\ttracking\ttool"
+        );
+    }
+
+    #[test]
+    fn stored_asset_preferences_override_current_desktop_detection() {
+        let mut record = PackageRecord {
+            id: PackageId::parse("example.com/tool").unwrap(),
+            current_version: None,
+            owner: "example.com".into(),
+            app: "tool".into(),
+            source_kind: SourceKind::Direct,
+            installation_dir: "/tmp/pkg".into(),
+            bin_dir: "/tmp/bin".into(),
+            pinned: false,
+            installed_asset_url: "https://example.com/tool".into(),
+            asset_preferences: Some(AssetPreferences(vec!["qt".into()])),
+            channel: None,
+            release_selector: None,
+            version_check_url: None,
+            validators: HttpValidators::default(),
+            rename_rules: Vec::new(),
+            installed_at: "now".into(),
+            updated_at: None,
+            binaries: vec!["tool".into()],
+        };
+        let detected = AssetPreferences(vec!["gtk".into()]);
+        assert_eq!(
+            effective_asset_preferences(Some(&record), detected.clone()),
+            AssetPreferences(vec!["qt".into()])
+        );
+
+        record.asset_preferences = None;
+        assert_eq!(
+            effective_asset_preferences(Some(&record), detected.clone()),
+            detected
+        );
+        assert_eq!(
+            effective_asset_preferences(None, AssetPreferences(vec!["gtk".into()])),
+            AssetPreferences(vec!["gtk".into()])
         );
     }
 
