@@ -66,6 +66,11 @@ fn project_install_and_uninstall_report_scope_and_use_project_state() {
         String::from_utf8(install.stdout).unwrap(),
         format!("Installed {} in project scope (~/project)\n", package.id)
     );
+    assert!(
+        String::from_utf8(install.stderr)
+            .unwrap()
+            .starts_with(&format!("Installing package {}\n", package.id))
+    );
     assert!(state.join("bin/tool").is_symlink());
     assert!(package.pinned);
     assert_eq!(
@@ -116,6 +121,10 @@ fn bare_project_install_reads_the_manifest_without_rewriting_it() {
         .unwrap();
     assert!(install.status.success(), "{:?}", install.stderr);
     server.join().unwrap();
+
+    let stderr = String::from_utf8(install.stderr).unwrap();
+    assert_eq!(stderr.matches("Installing package ").count(), 1);
+    assert!(stderr.starts_with("Installing package "));
 
     assert_eq!(
         std::fs::read_to_string(project.join("eget-packages.txt")).unwrap(),
@@ -243,5 +252,10 @@ fn explicit_project_install_records_successes_from_a_partially_failing_batch() {
         .unwrap();
     assert_eq!(install.status.code(), Some(1));
     server.join().unwrap();
+    let stderr = String::from_utf8(install.stderr).unwrap();
+    let success_label = url.trim_start_matches("http://");
+    assert!(stderr.starts_with("Installing package not a locref\nError processing not a locref:"));
+    assert!(stderr.contains(&format!("\nInstalling package {success_label}\n")));
+    assert_eq!(stderr.matches("Installing package ").count(), 2);
     assert_eq!(std::fs::read_to_string(marker).unwrap(), format!("{url}\n"));
 }

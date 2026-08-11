@@ -11,7 +11,7 @@ use crate::source::{self, AssetCandidate, ResolvedPackage};
 use crate::template::{self, UrlTemplate};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use regex::Regex;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -62,6 +62,8 @@ impl Installer {
             let mut manifest = self.load_manifest()?;
             let mut failed = false;
             for input in inputs {
+                let label = install_label(input);
+                render_install_status(&label);
                 let mut effective = options.clone();
                 effective.default_pin |= manifest.is_some();
                 match session.install(input, &effective) {
@@ -70,12 +72,12 @@ impl Installer {
                             && let Err(error) =
                                 manifest.upsert(&outcome.manifest_input, &outcome.record)
                         {
-                            eprintln!("Error processing {input}: {error:#}");
+                            render_install_error(&label, &error);
                             failed = true;
                         }
                     }
                     Err(error) => {
-                        eprintln!("Error processing {input}: {error:#}");
+                        render_install_error(&label, &error);
                         failed = true;
                     }
                 }
@@ -101,9 +103,11 @@ impl Installer {
             let entries = manifest.entries().cloned().collect::<Vec<_>>();
             let mut failed = false;
             for entry in entries {
+                let label = install_label(&entry.input);
+                render_install_status(&label);
                 let options = manifest_install_options(actions, &entry);
                 if let Err(error) = session.install(&entry.input, &options) {
-                    eprintln!("Error processing {}: {error:#}", entry.input);
+                    render_install_error(&label, &error);
                     failed = true;
                 }
             }
@@ -222,6 +226,7 @@ impl Installer {
                 requested_ids.to_vec()
             };
             let progress = ProgressBar::new(ids.len() as u64);
+            progress.set_draw_target(progress_draw_target());
             progress.set_style(
                 ProgressStyle::with_template("Checking updates {wide_bar:.cyan/blue} {pos}/{len}")?
                     .progress_chars("=> "),
@@ -302,6 +307,25 @@ fn manifest_install_options(actions: &InstallOptions, entry: &Entry) -> InstallO
         relocate: false,
         default_pin: true,
     }
+}
+
+fn install_label(input: &str) -> String {
+    source::package_identity_hint(input, None)
+        .ok()
+        .and_then(|hint| hint.ids.into_iter().next())
+        .unwrap_or_else(|| input.to_owned())
+}
+
+fn render_install_status(label: &str) {
+    eprintln!("Installing package {label}");
+}
+
+fn render_install_error(label: &str, error: &anyhow::Error) {
+    eprintln!("Error processing {label}: {error:#}");
+}
+
+fn progress_draw_target() -> ProgressDrawTarget {
+    ProgressDrawTarget::stderr_with_hz(4)
 }
 
 struct Session<'a> {
@@ -1007,6 +1031,7 @@ fn prepare_candidate(
     let progress = total
         .map(ProgressBar::new)
         .unwrap_or_else(ProgressBar::new_spinner);
+    progress.set_draw_target(progress_draw_target());
     progress.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} {bytes}/{total_bytes} {wide_bar:.cyan/blue}",
@@ -1279,6 +1304,20 @@ fn acquire_lock(lock: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_labels_use_best_effort_canonical_package_ids() {
+        assert_eq!(install_label("Owner/Repo"), "github.com/Owner/Repo");
+        assert_eq!(
+            install_label("https://gitlab.com/Group/Tool"),
+            "gitlab.com/Group/Tool"
+        );
+        assert_eq!(
+            install_label("https://downloads.example/tool-v2-linux-amd64.tar.gz"),
+            "downloads.example/tool"
+        );
+        assert_eq!(install_label("not a locref"), "not a locref");
+    }
 
     #[test]
     fn single_non_compatibility_failure_is_returned_without_a_misleading_summary() {
