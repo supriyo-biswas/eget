@@ -1872,9 +1872,25 @@ const ARCHIVE_SUFFIXES: &[&str] = &[
     ".tar.zst", ".tzst", ".gz", ".bz2", ".xz", ".zst",
 ];
 
+fn archive_suffix(name: &str) -> Option<&'static str> {
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    if name.ends_with(".appimage") {
+        return Some(".appimage");
+    }
+    ARCHIVE_SUFFIXES
+        .iter()
+        .filter(|suffix| name.ends_with(**suffix))
+        .max_by_key(|suffix| suffix.len())
+        .copied()
+}
+
 fn supported_asset(name: &str, tag: &str, platform: Platform) -> bool {
     let name = name.to_ascii_lowercase();
     let tag = tag.to_ascii_lowercase();
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    if name.ends_with(".appimage") && !matches!(platform, Platform::Linux { .. }) {
+        return false;
+    }
     if [".sig", ".asc", ".minisig", ".sha256", ".sha512", ".shasum"]
         .iter()
         .any(|suffix| name.ends_with(suffix))
@@ -1884,22 +1900,50 @@ fn supported_asset(name: &str, tag: &str, platform: Platform) -> bool {
     {
         return false;
     }
-    if !os_markers(platform.os())
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    let appimage = name.ends_with(".appimage");
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    let os_matches = appimage
+        || os_markers(platform.os())
+            .iter()
+            .any(|marker| marker_match(&name, marker));
+    #[cfg(not(all(target_os = "linux", feature = "extras")))]
+    let os_matches = os_markers(platform.os())
         .iter()
-        .any(|marker| marker_match(&name, marker))
-        || !arch_markers(platform)
+        .any(|marker| marker_match(&name, marker));
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    let arch_matches = if appimage {
+        appimage_arch_matches(&name, platform)
+    } else {
+        arch_markers(platform)
             .iter()
             .any(|marker| marker_match(&name, marker))
-    {
+    };
+    #[cfg(not(all(target_os = "linux", feature = "extras")))]
+    let arch_matches = arch_markers(platform)
+        .iter()
+        .any(|marker| marker_match(&name, marker));
+    if !os_matches || !arch_matches {
         return false;
     }
     (!tag.is_empty() && name.ends_with(&tag))
-        || ARCHIVE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+        || archive_suffix(&name).is_some()
         || terminal_platform_pair(&name, platform)
         || platform_suffixes(platform)
             .iter()
             .any(|suffix| name.ends_with(suffix))
         || Path::new(&name).extension().is_none()
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+fn appimage_arch_matches(name: &str, platform: Platform) -> bool {
+    let has_arch_marker = ["amd64", "x86_64", "x64", "linux64", "arm64", "aarch64"]
+        .iter()
+        .any(|marker| marker_match(name, marker));
+    !has_arch_marker
+        || arch_markers(platform)
+            .iter()
+            .any(|marker| marker_match(name, marker))
 }
 
 #[cfg(test)]
@@ -1913,7 +1957,7 @@ fn asset_score_with_preferences(
     asset_preferences: &AssetPreferences,
 ) -> i32 {
     let name = name.to_ascii_lowercase();
-    let mut score = i32::from(ARCHIVE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))) * 10;
+    let mut score = i32::from(archive_suffix(&name).is_some()) * 10;
     match platform {
         Platform::Linux { libc, .. } => {
             for marker in ["gtk", "qt"] {
@@ -2106,6 +2150,11 @@ fn direct_app(url: &Url) -> String {
         .unwrap_or_else(|| "default".to_owned())
 }
 
+#[cfg(all(target_os = "linux", feature = "extras"))]
+pub(crate) fn artifact_app(name: &str) -> Option<String> {
+    normalized_app_segment(name)
+}
+
 fn direct_url_has_version(url: &Url) -> bool {
     DIRECT_URL_VERSION.is_match(url.path())
 }
@@ -2117,11 +2166,7 @@ const PLATFORM_NAME_MARKERS: &[&str] = &[
 
 fn normalized_app_segment(segment: &str) -> Option<String> {
     let mut name = segment.to_ascii_lowercase();
-    if let Some(suffix) = ARCHIVE_SUFFIXES
-        .iter()
-        .filter(|suffix| name.ends_with(**suffix))
-        .max_by_key(|suffix| suffix.len())
-    {
+    if let Some(suffix) = archive_suffix(&name) {
         name.truncate(name.len() - suffix.len());
     }
     name = name
@@ -2747,6 +2792,10 @@ mod tests {
             "tool"
         );
         assert_eq!(
+            direct_app(&normalized_url("https://example.com/Ghostty-x86_64.AppImage").unwrap()),
+            "ghostty"
+        );
+        assert_eq!(
             direct_app(&normalized_url("https://example.com").unwrap()),
             "default"
         );
@@ -2773,9 +2822,38 @@ mod tests {
         };
         assert!(supported_asset("tool-linux-amd64.tar.gz", "v1", platform));
         assert!(supported_asset("tool-linux-amd64.7z", "v1", platform));
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        assert!(supported_asset(
+            "tool-linux-x86_64.AppImage",
+            "v1",
+            platform
+        ));
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        assert!(supported_asset("OpenOffice.AppImage", "latest", platform));
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        assert!(!supported_asset(
+            "tool-linux-aarch64.AppImage",
+            "v1",
+            platform
+        ));
+        #[cfg(not(all(target_os = "linux", feature = "extras")))]
+        assert!(!supported_asset(
+            "tool-linux-x86_64.AppImage",
+            "v1",
+            platform
+        ));
+        #[cfg(not(all(target_os = "linux", feature = "extras")))]
+        assert!(!supported_asset("OpenOffice.AppImage", "latest", platform));
         assert!(supported_asset("tool-linux-amd64", "v1", platform));
         assert!(!supported_asset("tool-windows-amd64.zip", "v1", platform));
         assert!(!supported_asset("checksums-linux-amd64", "v1", platform));
+        assert!(!supported_asset(
+            "tool-darwin-arm64.AppImage",
+            "v1",
+            Platform::Macos {
+                arch: HostArch::Aarch64,
+            }
+        ));
     }
 
     #[test]

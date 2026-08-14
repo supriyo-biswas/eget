@@ -18,6 +18,18 @@ chmod +x eget
 mv eget ~/.local/bin # or any other location on your PATH
 ```
 
+The default Linux download is the smaller build. To install applications
+distributed as AppImages, use the Linux extras build by appending `-extras` to
+the artifact name:
+
+```sh
+curl -sSLfo eget \
+  "https://github.com/supriyo-biswas/eget/releases/latest/download/eget-$(uname -sm | tr 'A-Z ' 'a-z-')-extras"
+```
+
+The extras artifact is published for Linux x86-64 and aarch64. macOS has only
+the standard build because AppImage is a Linux format.
+
 ## Installing tools with `eget`
 
 For GitHub, use the repository name. The `install` command is optional, and

@@ -1,3 +1,5 @@
+#[cfg(all(target_os = "linux", feature = "extras"))]
+mod appimage;
 pub mod archive;
 pub mod cli;
 pub mod compat;

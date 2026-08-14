@@ -5,6 +5,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::symlink;
+#[cfg(all(target_os = "linux", feature = "extras"))]
+use std::process::Command;
 use std::thread;
 
 fn server(body: &'static [u8], requests: usize) -> (String, thread::JoinHandle<Vec<String>>) {
@@ -109,6 +111,49 @@ fn direct_package_round_trip_uses_new_schema_and_managed_symlink() {
     );
     assert!(fs::symlink_metadata(scope.bin_dir.join("tool")).is_err());
     assert!(database.packages().unwrap().is_empty());
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+#[test]
+fn direct_appimage_extracts_and_exposes_only_apprun() {
+    static IMAGE: &[u8] = include_bytes!("fixtures/archives/safe.AppImage");
+    let temp = tempfile::tempdir().unwrap();
+    let scope = scope(&temp);
+    let installer = Installer::new(scope.clone()).unwrap();
+    let (url, server) = server(IMAGE, 2);
+
+    assert_eq!(
+        installer
+            .install_many(std::slice::from_ref(&url), &InstallOptions::default())
+            .unwrap(),
+        0
+    );
+    assert_eq!(server.join().unwrap(), ["/api/v1/version", "/tool"]);
+
+    let package = Database::open(&scope.database, &scope.package_root)
+        .unwrap()
+        .packages()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(package.binaries, ["tool"]);
+    assert_eq!(
+        fs::read_link(scope.bin_dir.join("tool")).unwrap(),
+        package.installation_dir.join(".eget-appimage-launcher")
+    );
+    assert!(
+        Command::new(scope.bin_dir.join("tool"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(package.installation_dir.join("fixture.desktop").exists());
+    assert!(
+        !package
+            .installation_dir
+            .join(".eget-appimage.desktop")
+            .exists()
+    );
 }
 
 #[test]

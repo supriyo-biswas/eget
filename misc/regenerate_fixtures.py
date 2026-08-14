@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Regenerate deterministic archive-security fixtures.
 
-Requires Python 3 and the `7z` and `zstd` commands. All metadata and compression
-inputs are fixed so repeated runs produce byte-identical files.
+Requires Python 3 and the `7z`, `mksquashfs`, and `zstd` commands. All metadata
+and compression inputs are fixed so repeated runs produce byte-identical files.
 """
 
 from __future__ import annotations
@@ -243,6 +243,59 @@ def executable_fixtures() -> None:
     (root / "script-absolute").write_bytes(b"#!/bin/sh\necho fixture\n")
 
 
+def appimage_fixture() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        source = Path(temporary) / "AppDir"
+        source.mkdir()
+        (source / "AppRun").write_bytes(
+            b"#!/bin/sh\ntest -n \"$APPDIR\" && test -n \"$OWD\" && test -n \"$ARGV0\"\n"
+        )
+        (source / "fixture.desktop").write_text(
+            "[Desktop Entry]\nType=Application\nName=Fixture\nExec=AppRun %U\nIcon=fixture\n",
+            encoding="utf-8",
+        )
+        (source / "fixture.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>\n',
+            encoding="utf-8",
+        )
+        (source / ".DirIcon").symlink_to("fixture.svg")
+        os.chmod(source / "AppRun", 0o755)
+        for path in [
+            source / "AppRun",
+            source / "fixture.desktop",
+            source / "fixture.svg",
+            source / ".DirIcon",
+            source,
+        ]:
+            set_mtime(path)
+        squashfs = Path(temporary) / "payload.squashfs"
+        subprocess.run(
+            [
+                "mksquashfs",
+                str(source),
+                str(squashfs),
+                "-noappend",
+                "-comp",
+                "zstd",
+                "-all-root",
+                "-no-xattrs",
+                "-no-exports",
+                "-no-progress",
+                "-mkfs-time",
+                str(MTIME),
+                "-all-time",
+                str(MTIME),
+                "-processors",
+                "1",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        header = bytearray(elf(62, 2, 0x400000))
+        header[8:11] = b"AI\x02"
+        (ROOT / "safe.AppImage").write_bytes(bytes(header) + squashfs.read_bytes())
+
+
 def main() -> None:
     if ROOT.exists():
         shutil.rmtree(ROOT)
@@ -254,6 +307,7 @@ def main() -> None:
     malicious()
     singles()
     executable_fixtures()
+    appimage_fixture()
 
 
 if __name__ == "__main__":

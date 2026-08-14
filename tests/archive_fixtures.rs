@@ -119,3 +119,51 @@ fn single_stream_formats_become_executable() {
         );
     }
 }
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+#[test]
+fn appimage_extracts_without_executing_its_runtime() {
+    let temp = tempfile::tempdir().unwrap();
+    let format = archive::extract(
+        &fixtures().join("safe.AppImage"),
+        "safe.AppImage",
+        "fixture",
+        temp.path(),
+    )
+    .unwrap();
+    assert_eq!(format, archive::Format::AppImage);
+    assert_eq!(
+        fs::metadata(temp.path().join("AppRun"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::read_link(temp.path().join(".DirIcon")).unwrap(),
+        Path::new("fixture.svg")
+    );
+}
+
+#[cfg(not(all(target_os = "linux", feature = "extras")))]
+#[test]
+fn appimage_uses_plain_executable_behavior_without_extras() {
+    let source = fixtures().join("safe.AppImage");
+    let temp = tempfile::tempdir().unwrap();
+    let format = archive::extract(&source, "safe.AppImage", "safe", temp.path()).unwrap();
+
+    assert_eq!(format, archive::Format::Plain);
+    assert_eq!(
+        fs::read(temp.path().join("safe")).unwrap(),
+        fs::read(source).unwrap()
+    );
+    assert_eq!(
+        fs::metadata(temp.path().join("safe"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+}

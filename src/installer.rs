@@ -21,11 +21,15 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(all(target_os = "linux", feature = "extras"))]
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 use tempfile::{Builder, TempDir};
+#[cfg(all(target_os = "linux", feature = "extras"))]
+use walkdir::WalkDir;
 
 pub struct Installer {
     scope: Scope,
@@ -722,7 +726,13 @@ impl Session<'_> {
         record: PackageRecord,
         force: bool,
     ) -> Result<()> {
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        let mut prepared = prepared;
+        #[cfg(not(all(target_os = "linux", feature = "extras")))]
+        let prepared = prepared;
         self.scope.validate_install_dir(&record.installation_dir)?;
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        prepared.prepare_desktop(&record, self.scope)?;
         let links = prepared.links(&record.installation_dir, &record.bin_dir);
         let old_links = old
             .into_iter()
@@ -733,11 +743,20 @@ impl Session<'_> {
                     .map(|name| package.bin_dir.join(name))
             })
             .collect::<BTreeSet<_>>();
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        let mut old_links = old_links;
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        if let Some(package) = old
+            && let Some(path) = self.scope.desktop_entry_path(&package.id)
+            && owned_link(&path, &package.installation_dir)
+        {
+            old_links.insert(path);
+        }
 
         for (path, _) in &links {
             if fs::symlink_metadata(path).is_ok() && !old_links.contains(path) && !force {
                 bail!(
-                    "command path already exists: {} (use --force to replace it)",
+                    "managed link path already exists: {} (use --force to replace it)",
                     path.display()
                 )
             }
@@ -764,8 +783,10 @@ impl Session<'_> {
         let activation = (|| -> Result<()> {
             fs::rename(&prepared.root, &record.installation_dir)
                 .context("promote staged package")?;
-            fs::create_dir_all(&record.bin_dir)?;
             for (path, target) in &links {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
                 symlink(target, path).with_context(|| format!("link {}", path.display()))?;
             }
             let transaction = self.database.transaction()?;
@@ -818,6 +839,12 @@ impl Session<'_> {
                 owned_links.push((path, target));
             }
         }
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        if let Some(path) = self.scope.desktop_entry_path(&package.id)
+            && owned_link(&path, &package.installation_dir)
+        {
+            owned_links.push((path.clone(), fs::read_link(path)?));
+        }
         let quarantine = Builder::new()
             .prefix("tmp-uninstall-")
             .tempdir_in(&self.scope.package_root)?;
@@ -852,6 +879,19 @@ impl Session<'_> {
         println!("Uninstalled {id} in {}", self.scope.description());
         Ok(package)
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+fn owned_link(path: &Path, installation_dir: &Path) -> bool {
+    let canonical_installation_dir = installation_dir.canonicalize().ok();
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && path.canonicalize().is_ok_and(|target| {
+            canonical_installation_dir
+                .as_ref()
+                .is_some_and(|installation_dir| {
+                    target != *installation_dir && target.starts_with(installation_dir)
+                })
+        })
 }
 
 fn installed_manifest_input(input: &str, package: &PackageRecord) -> String {
@@ -906,9 +946,19 @@ enum UpdateProbe {
 struct Prepared {
     temp: TempDir,
     root: PathBuf,
-    binaries: Vec<PathBuf>,
+    commands: Vec<PreparedCommand>,
     asset_url: String,
     validators: HttpValidators,
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    desktop_source: Option<PathBuf>,
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    desktop_link: Option<PathBuf>,
+}
+
+struct PreparedCommand {
+    name: String,
+    target: PathBuf,
+    logical_only_rename: bool,
 }
 
 #[derive(Debug)]
@@ -924,45 +974,93 @@ impl Error for NoCompatibleExecutable {}
 
 impl Prepared {
     fn binary_names(&self) -> Vec<String> {
-        self.binaries
+        self.commands
             .iter()
-            .filter_map(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
+            .map(|command| command.name.clone())
             .collect()
     }
 
     fn links(&self, install_dir: &Path, bin_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
-        self.binaries
+        let links = self
+            .commands
             .iter()
-            .map(|binary| {
-                let relative = binary.strip_prefix(&self.root).expect("binary below root");
-                (
-                    bin_dir.join(binary.file_name().expect("binary has name")),
-                    install_dir.join(relative),
-                )
+            .map(|command| {
+                let relative = command
+                    .target
+                    .strip_prefix(&self.root)
+                    .expect("command target below root");
+                (bin_dir.join(&command.name), install_dir.join(relative))
             })
-            .collect()
+            .collect::<Vec<_>>();
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        {
+            let mut links = links;
+            if let Some(path) = &self.desktop_link {
+                links.push((path.clone(), install_dir.join(".eget-appimage.desktop")));
+            }
+            links
+        }
+        #[cfg(not(all(target_os = "linux", feature = "extras")))]
+        {
+            links
+        }
     }
 
     fn apply_rename_rules(&mut self, rules: &[RenameRule]) -> Result<()> {
         for RenameRule(from, to) in rules {
             let Some(index) = self
-                .binaries
+                .commands
                 .iter()
-                .position(|path| path.file_name().is_some_and(|name| name == from.as_str()))
+                .position(|command| command.name == *from)
             else {
                 bail!("rename source is not a discovered binary: {from}")
             };
-            let target = self.binaries[index].with_file_name(to);
-            if fs::symlink_metadata(&target).is_ok()
-                || self.binaries.iter().any(|binary| binary == &target)
-            {
+            if self.commands.iter().any(|command| command.name == *to) {
                 bail!("rename target already exists: {to}")
             }
-            fs::rename(&self.binaries[index], &target)?;
-            self.binaries[index] = target;
+            if !self.commands[index].logical_only_rename {
+                let target = self.commands[index].target.with_file_name(to);
+                if fs::symlink_metadata(&target).is_ok()
+                    || self.commands.iter().any(|command| command.target == target)
+                {
+                    bail!("rename target already exists: {to}")
+                }
+                fs::rename(&self.commands[index].target, &target)?;
+                self.commands[index].target = target;
+            }
+            self.commands[index].name.clone_from(to);
         }
-        self.binaries.sort();
+        self.commands
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    fn prepare_desktop(&mut self, record: &PackageRecord, scope: &Scope) -> Result<()> {
+        let Some(source) = self.desktop_source.as_deref() else {
+            return Ok(());
+        };
+        let Some(link) = scope.desktop_entry_path(&record.id) else {
+            return Ok(());
+        };
+        let command = self
+            .commands
+            .first()
+            .context("AppImage command is missing")?;
+        let generated = self.root.join(".eget-appimage.desktop");
+        if fs::symlink_metadata(&generated).is_ok() {
+            bail!("AppImage contains reserved path .eget-appimage.desktop")
+        }
+        match rewrite_desktop_entry(
+            source,
+            &generated,
+            &self.root,
+            &record.installation_dir,
+            &record.bin_dir.join(&command.name),
+        ) {
+            Ok(()) => self.desktop_link = Some(link),
+            Err(error) => eprintln!("Warning: skipped AppImage desktop integration: {error:#}"),
+        }
         Ok(())
     }
 }
@@ -972,16 +1070,31 @@ fn prepare(client: &Client, scope: &Scope, package: &ResolvedPackage) -> Result<
         .prefix("tmp-")
         .tempdir_in(&scope.package_root)?;
     let host = compat::Host::current()?;
+    let installation_dir = scope.installation_dir(&PackageId::parse(package.id.clone())?);
     let mut failures = Vec::new();
     for (index, candidate) in package.candidates.iter().enumerate() {
-        match prepare_candidate(client, &temp, package, candidate, index, host) {
-            Ok((root, binaries, validators)) => {
+        match prepare_candidate(
+            client,
+            &temp,
+            package,
+            candidate,
+            index,
+            host,
+            &installation_dir,
+        ) {
+            Ok((root, commands, validators, desktop_source)) => {
+                #[cfg(not(all(target_os = "linux", feature = "extras")))]
+                let _ = desktop_source;
                 return Ok(Prepared {
                     temp,
                     root,
-                    binaries,
+                    commands,
                     asset_url: candidate.url.clone(),
                     validators,
+                    #[cfg(all(target_os = "linux", feature = "extras"))]
+                    desktop_source,
+                    #[cfg(all(target_os = "linux", feature = "extras"))]
+                    desktop_link: None,
                 });
             }
             Err(error) => failures.push((candidate.name.clone(), error)),
@@ -1020,7 +1133,13 @@ fn prepare_candidate(
     candidate: &AssetCandidate,
     index: usize,
     host: compat::Host,
-) -> Result<(PathBuf, Vec<PathBuf>, HttpValidators)> {
+    installation_dir: &Path,
+) -> Result<(
+    PathBuf,
+    Vec<PreparedCommand>,
+    HttpValidators,
+    Option<PathBuf>,
+)> {
     let candidate_root = temp.path().join(format!("candidate-{index}"));
     let tree = candidate_root.join("tree");
     fs::create_dir_all(&candidate_root)?;
@@ -1049,8 +1168,40 @@ fn prepare_candidate(
         progress.inc(count as u64);
     }
     progress.finish_and_clear();
-    archive::extract(&payload, &candidate.name, &package.app, &tree)?;
+    let extracted_format = archive::extract(&payload, &candidate.name, &package.app, &tree)?;
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    let root = if extracted_format == Format::AppImage {
+        tree.canonicalize()?
+    } else {
+        compat::descend_single_root(tree)?.canonicalize()?
+    };
+    #[cfg(not(all(target_os = "linux", feature = "extras")))]
     let root = compat::descend_single_root(tree)?.canonicalize()?;
+    #[cfg(not(all(target_os = "linux", feature = "extras")))]
+    let _ = (installation_dir, extracted_format);
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    if extracted_format == Format::AppImage {
+        let apprun = root.join("AppRun");
+        if !compat::inspect(&apprun, host)? {
+            return Err(NoCompatibleExecutable.into());
+        }
+        let launcher = root.join(".eget-appimage-launcher");
+        if fs::symlink_metadata(&launcher).is_ok() {
+            bail!("AppImage contains reserved path .eget-appimage-launcher")
+        }
+        write_appimage_launcher(&launcher, installation_dir)?;
+        let desktop_source = appimage_desktop_source(&root)?;
+        return Ok((
+            root,
+            vec![PreparedCommand {
+                name: appimage_command_name(&package.app, &candidate.name),
+                target: launcher,
+                logical_only_rename: true,
+            }],
+            validators,
+            desktop_source,
+        ));
+    }
     let has_modes = matches!(
         archive::format(&candidate.name),
         Format::SevenZ
@@ -1072,7 +1223,222 @@ fn prepare_candidate(
             binaries[0] = renamed;
         }
     }
-    Ok((root, binaries, validators))
+    let commands = binaries
+        .into_iter()
+        .map(|target| PreparedCommand {
+            name: target
+                .file_name()
+                .expect("discovered executable has a name")
+                .to_string_lossy()
+                .into_owned(),
+            target,
+            logical_only_rename: false,
+        })
+        .collect();
+    Ok((root, commands, validators, None))
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+fn appimage_command_name(package_app: &str, asset_name: &str) -> String {
+    if let Some(name) = source::artifact_app(asset_name)
+        && !matches!(name.as_str(), "app" | "appimage" | "application")
+    {
+        return name;
+    }
+
+    let lower = package_app.to_ascii_lowercase();
+    for suffix in ["-appimage", "_appimage", ".appimage"] {
+        if lower.ends_with(suffix) && package_app.len() > suffix.len() {
+            return package_app[..package_app.len() - suffix.len()].to_owned();
+        }
+    }
+    package_app.to_owned()
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+fn write_appimage_launcher(path: &Path, installation_dir: &Path) -> Result<()> {
+    let appdir = installation_dir
+        .to_str()
+        .context("AppImage installation path is not valid UTF-8")?;
+    let appdir = shlex::try_quote(appdir).context("quote AppImage installation path")?;
+    let script = format!(
+        "#!/bin/sh\nAPPDIR={appdir}\nOWD=$PWD\nARGV0=$0\nexport APPDIR OWD ARGV0\nexec \"$APPDIR/AppRun\" \"$@\"\n"
+    );
+    fs::write(path, script)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+fn appimage_desktop_source(root: &Path) -> Result<Option<PathBuf>> {
+    let mut entries = fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "desktop")
+        })
+        .filter(|path| fs::metadata(path).is_ok_and(|metadata| metadata.is_file()))
+        .collect::<Vec<_>>();
+    entries.sort();
+    Ok((entries.len() == 1).then(|| entries.remove(0)))
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+fn rewrite_desktop_entry(
+    source: &Path,
+    destination: &Path,
+    staged_root: &Path,
+    installation_dir: &Path,
+    command_path: &Path,
+) -> Result<()> {
+    let input = fs::read_to_string(source).context("read AppImage desktop entry")?;
+    let command = command_path
+        .to_str()
+        .context("AppImage command path is not valid UTF-8")?;
+    let mut group = "";
+    let mut valid_type = false;
+    let mut main_exec = false;
+    let mut icon = None;
+    for line in input.lines() {
+        if line.starts_with('[') && line.ends_with(']') {
+            group = line;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if group == "[Desktop Entry]" {
+            valid_type |= key.trim() == "Type" && value.trim() == "Application";
+            main_exec |= key.trim() == "Exec" && !value.trim().is_empty();
+            if key.trim() == "Icon" {
+                icon = Some(value.trim().to_owned());
+            }
+        }
+    }
+    if !valid_type || !main_exec {
+        bail!("desktop entry must contain Type=Application and Exec")
+    }
+    let installed_icon = icon
+        .as_deref()
+        .and_then(|name| resolve_appimage_icon(staged_root, name).ok().flatten())
+        .and_then(|path| path.strip_prefix(staged_root).ok().map(Path::to_path_buf))
+        .map(|relative| installation_dir.join(relative));
+
+    group = "";
+    let mut output = String::with_capacity(input.len() + command.len());
+    for line in input.lines() {
+        if line.starts_with('[') && line.ends_with(']') {
+            group = line;
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        };
+        let key = key.trim();
+        let rewritten = if key == "Exec"
+            && (group == "[Desktop Entry]" || group.starts_with("[Desktop Action "))
+        {
+            Some(rewrite_desktop_exec(value, command)?)
+        } else if group == "[Desktop Entry]" && key == "TryExec" {
+            Some(command.to_owned())
+        } else if group == "[Desktop Entry]" && key == "DBusActivatable" {
+            Some("false".to_owned())
+        } else if group == "[Desktop Entry]" && key == "Icon" {
+            installed_icon
+                .as_ref()
+                .and_then(|path| path.to_str())
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        if let Some(value) = rewritten {
+            output.push_str(key);
+            output.push('=');
+            output.push_str(&value);
+        } else {
+            output.push_str(line);
+        }
+        output.push('\n');
+    }
+    fs::write(destination, output)?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o644))?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+fn rewrite_desktop_exec(value: &str, command: &str) -> Result<String> {
+    let mut arguments = shlex::split(value).context("invalid desktop Exec command line")?;
+    if arguments.is_empty() {
+        bail!("empty desktop Exec command line")
+    }
+    arguments[0] = command.to_owned();
+    Ok(arguments
+        .iter()
+        .map(|argument| desktop_exec_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+fn desktop_exec_quote(argument: &str) -> String {
+    if argument.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-' | '%' | ':')
+    }) {
+        return argument.to_owned();
+    }
+    let escaped = argument
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('`', "\\`")
+        .replace('$', "\\$");
+    format!("\"{escaped}\"")
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+fn resolve_appimage_icon(root: &Path, icon: &str) -> Result<Option<PathBuf>> {
+    if icon.is_empty() || Path::new(icon).is_absolute() || icon.contains('/') {
+        return Ok(None);
+    }
+    let mut candidates = WalkDir::new(root.join("usr/share/icons/hicolor"))
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file() || entry.file_type().is_symlink())
+        .map(|entry| entry.into_path())
+        .filter(|path| icon_matches(path, icon))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    for extension in ["svg", "svgz", "png"] {
+        candidates.push(root.join(format!("{icon}.{extension}")));
+    }
+    candidates.push(root.join(icon));
+    candidates.push(root.join(".DirIcon"));
+    for candidate in candidates {
+        if !fs::metadata(&candidate).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let canonical = candidate.canonicalize()?;
+        if canonical.starts_with(root) {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(all(target_os = "linux", feature = "extras"))]
+fn icon_matches(path: &Path, icon: &str) -> bool {
+    let supported = path
+        .extension()
+        .is_some_and(|extension| matches!(extension.to_str(), Some("png" | "svg" | "svgz")));
+    supported
+        && path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy() == icon)
 }
 
 fn direct_changed(
@@ -1304,6 +1670,27 @@ fn acquire_lock(lock: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    #[test]
+    fn appimage_command_prefers_normalized_asset_name_then_repository_fallback() {
+        assert_eq!(
+            appimage_command_name("ghostty-appimage", "Ghostty-1.3.1-x86_64.AppImage"),
+            "ghostty"
+        );
+        assert_eq!(
+            appimage_command_name("mpv-AppImage", "mpv-v0.41.0-anylinux-x86_64.AppImage"),
+            "mpv"
+        );
+        assert_eq!(
+            appimage_command_name("ghostty-appimage", "app.AppImage"),
+            "ghostty"
+        );
+        assert_eq!(
+            appimage_command_name("OpenOffice", "app.AppImage"),
+            "OpenOffice"
+        );
+    }
 
     #[test]
     fn install_labels_use_best_effort_canonical_package_ids() {
@@ -1556,5 +1943,36 @@ mod tests {
             "v3"
         );
         assert!(extract_version("\n \t\r\n", VersionResponseKind::PlainText).is_err());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    #[test]
+    fn appimage_desktop_entry_uses_managed_command_and_icon() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tree");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("app.svg"), "<svg/>").unwrap();
+        let source = root.join("app.desktop");
+        fs::write(
+            &source,
+            "# keep\n[Desktop Entry]\nType=Application\nName=App\nExec=AppRun --open %U\nTryExec=AppRun\nIcon=app\nDBusActivatable=true\n\n[Desktop Action New]\nName=New\nExec=AppRun --new\n",
+        )
+        .unwrap();
+        let generated = root.join(".eget-appimage.desktop");
+        rewrite_desktop_entry(
+            &source,
+            &generated,
+            &root,
+            Path::new("/opt/eget/package"),
+            Path::new("/usr/local/bin/renamed"),
+        )
+        .unwrap();
+        let output = fs::read_to_string(generated).unwrap();
+        assert!(output.contains("# keep\n"));
+        assert!(output.contains("Exec=/usr/local/bin/renamed --open %U"));
+        assert!(output.contains("Exec=/usr/local/bin/renamed --new"));
+        assert!(output.contains("TryExec=/usr/local/bin/renamed"));
+        assert!(output.contains("Icon=/opt/eget/package/app.svg"));
+        assert!(output.contains("DBusActivatable=false"));
     }
 }

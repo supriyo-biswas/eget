@@ -31,6 +31,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo test --no-default-features
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
 
@@ -46,8 +48,8 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --target x86_64-unknown-linux-musl
-      - name: Verify and package
+      - run: cargo build --release --no-default-features --target x86_64-unknown-linux-musl
+      - name: Verify and package lean build
         run: |
           set -euo pipefail
           binary=target/x86_64-unknown-linux-musl/release/eget
@@ -59,7 +61,29 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: eget-linux-x86_64
-          path: eget-linux-x86_64*
+          path: |
+            eget-linux-x86_64
+            eget-linux-x86_64.tar.gz
+      - run: cargo build --release --no-default-features --features extras --target x86_64-unknown-linux-musl
+      - name: Verify and package extras build
+        run: |
+          set -euo pipefail
+          binary=target/x86_64-unknown-linux-musl/release/eget
+          file "$binary" | tee /dev/stderr | grep -Eq "statically linked|static-pie linked"
+          dependencies="$(readelf -dW "$binary" | awk '$2 == "(NEEDED)"')"
+          test -z "$dependencies" || { echo "dynamic dependencies: $dependencies" >&2; exit 1; }
+          cp "$binary" eget-linux-x86_64-extras
+          tar -C "$(dirname "$binary")" -czf eget-linux-x86_64-extras.tar.gz eget
+          lean_size="$(stat -c %s eget-linux-x86_64)"
+          extras_size="$(stat -c %s eget-linux-x86_64-extras)"
+          echo "lean: $lean_size bytes; extras: $extras_size bytes"
+          test "$lean_size" -lt "$extras_size"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eget-linux-x86_64-extras
+          path: |
+            eget-linux-x86_64-extras
+            eget-linux-x86_64-extras.tar.gz
 
   build-linux-aarch64:
     name: Build Linux aarch64
@@ -73,8 +97,8 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --target aarch64-unknown-linux-musl
-      - name: Verify and package
+      - run: cargo build --release --no-default-features --target aarch64-unknown-linux-musl
+      - name: Verify and package lean build
         run: |
           set -euo pipefail
           binary=target/aarch64-unknown-linux-musl/release/eget
@@ -86,7 +110,29 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: eget-linux-aarch64
-          path: eget-linux-aarch64*
+          path: |
+            eget-linux-aarch64
+            eget-linux-aarch64.tar.gz
+      - run: cargo build --release --no-default-features --features extras --target aarch64-unknown-linux-musl
+      - name: Verify and package extras build
+        run: |
+          set -euo pipefail
+          binary=target/aarch64-unknown-linux-musl/release/eget
+          file "$binary" | tee /dev/stderr | grep -Eq "statically linked|static-pie linked"
+          dependencies="$(readelf -dW "$binary" | awk '$2 == "(NEEDED)"')"
+          test -z "$dependencies" || { echo "dynamic dependencies: $dependencies" >&2; exit 1; }
+          cp "$binary" eget-linux-aarch64-extras
+          tar -C "$(dirname "$binary")" -czf eget-linux-aarch64-extras.tar.gz eget
+          lean_size="$(stat -c %s eget-linux-aarch64)"
+          extras_size="$(stat -c %s eget-linux-aarch64-extras)"
+          echo "lean: $lean_size bytes; extras: $extras_size bytes"
+          test "$lean_size" -lt "$extras_size"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eget-linux-aarch64-extras
+          path: |
+            eget-linux-aarch64-extras
+            eget-linux-aarch64-extras.tar.gz
 
   build-darwin-arm64:
     name: Build macOS arm64
@@ -97,7 +143,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
-      - run: cargo build --release --target aarch64-apple-darwin
+      - run: cargo build --release --no-default-features --target aarch64-apple-darwin
       - name: Verify and package
         run: |
           set -euo pipefail

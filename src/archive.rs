@@ -24,11 +24,17 @@ pub enum Format {
     Bz2,
     Xz,
     Zst,
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    AppImage,
     Plain,
 }
 
 pub fn format(name: &str) -> Format {
     let n = name.to_ascii_lowercase();
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    if n.ends_with(".appimage") {
+        return Format::AppImage;
+    }
     for (suffix, kind) in [
         (".7z", Format::SevenZ),
         (".tar.gz", Format::TarGz),
@@ -54,10 +60,23 @@ pub fn format(name: &str) -> Format {
     Format::Plain
 }
 
-pub fn extract(payload: &Path, source_name: &str, app: &str, dest: &Path) -> Result<()> {
+pub fn extract(payload: &Path, source_name: &str, app: &str, dest: &Path) -> Result<Format> {
     fs::create_dir_all(dest)?;
     fs::set_permissions(dest, fs::Permissions::from_mode(0o700))?;
-    match format(source_name) {
+    let named_format = format(source_name);
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    let detected_format = match crate::appimage::image_type(payload)? {
+        Some(2) => Format::AppImage,
+        Some(1) => bail!("type-1 AppImage is not supported"),
+        Some(kind) => bail!("unsupported AppImage type {kind}"),
+        None if named_format == Format::AppImage => {
+            bail!("file named as an AppImage does not contain valid AppImage type-2 magic")
+        }
+        None => named_format,
+    };
+    #[cfg(not(all(target_os = "linux", feature = "extras")))]
+    let detected_format = named_format;
+    match detected_format {
         Format::SevenZ => extract_7z(payload, dest)?,
         Format::Zip => extract_zip(payload, dest)?,
         f @ (Format::Tar | Format::TarGz | Format::TarBz2 | Format::TarXz | Format::TarZst) => {
@@ -72,12 +91,15 @@ pub fn extract(payload: &Path, source_name: &str, app: &str, dest: &Path) -> Res
             app,
             dest,
         )?,
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        Format::AppImage => crate::appimage::extract(payload, dest)?,
         Format::Plain => {
             fs::copy(payload, dest.join(app))?;
             fs::set_permissions(dest.join(app), fs::Permissions::from_mode(0o755))?;
         }
     }
-    containment_walk(dest)
+    containment_walk(dest)?;
+    Ok(detected_format)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -412,6 +434,10 @@ mod tests {
     fn suffixes() {
         assert_eq!(format("x.7Z"), Format::SevenZ);
         assert_eq!(format("x.tzst"), Format::TarZst);
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        assert_eq!(format("x.AppImage"), Format::AppImage);
+        #[cfg(not(all(target_os = "linux", feature = "extras")))]
+        assert_eq!(format("x.AppImage"), Format::Plain);
         assert_eq!(format("tool-linux"), Format::Plain)
     }
 }

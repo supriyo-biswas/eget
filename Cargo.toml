@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 description = "Install standalone executables from GitHub, Gitea, GitLab, and direct URLs"
 
+[features]
+default = []
+extras = ["dep:backhand", "dep:dwarfs"]
+
 [dependencies]
 anyhow = "1.0"
 bzip2 = "0.6"
@@ -32,6 +36,10 @@ xz2 = { version = "0.1", features = ["static"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zip = { version = "4.3", default-features = false, features = ["deflate", "bzip2", "zstd"] }
 zstd = "0.13"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+backhand = { version = "0.25.1", optional = true, default-features = false, features = ["gzip", "zstd"] }
+dwarfs = { version = "0.2.1", optional = true, default-features = false, features = ["zstd"] }
 
 [dev-dependencies]
 hex = "0.4"

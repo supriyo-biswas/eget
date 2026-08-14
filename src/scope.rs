@@ -180,6 +180,16 @@ impl Scope {
         self.package_root.join(id.directory_name())
     }
 
+    #[cfg(all(target_os = "linux", feature = "extras"))]
+    pub fn desktop_entry_path(&self, id: &PackageId) -> Option<PathBuf> {
+        let applications = match self.kind {
+            ScopeKind::System => PathBuf::from("/usr/share/applications"),
+            ScopeKind::User => self.package_root.parent()?.join("applications"),
+            ScopeKind::Project => return None,
+        };
+        Some(applications.join(format!("eget-{}.desktop", id.directory_name())))
+    }
+
     pub fn validate_install_dir(&self, path: &Path) -> Result<()> {
         let root = self.package_root.canonicalize()?;
         let parent = path
@@ -308,6 +318,13 @@ mod tests {
             Path::new("/home/test/.local/share/eget/eget.sqlite3")
         );
         assert_eq!(user.lock, Path::new("/home/test/.local/share/eget.lock"));
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        let id = PackageId::parse("github.com/owner/app").unwrap();
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        assert_eq!(
+            user.desktop_entry_path(&id).unwrap().parent().unwrap(),
+            Path::new("/home/test/.local/share/applications")
+        );
 
         let system = resolve(None, 0, None, &[]).unwrap();
         assert_eq!(
@@ -315,6 +332,11 @@ mod tests {
             Path::new("/var/lib/eget/eget/eget.sqlite3")
         );
         assert_eq!(system.lock, Path::new("/run/lock/eget.lock"));
+        #[cfg(all(target_os = "linux", feature = "extras"))]
+        assert_eq!(
+            system.desktop_entry_path(&id).unwrap().parent().unwrap(),
+            Path::new("/usr/share/applications")
+        );
     }
 
     #[test]
