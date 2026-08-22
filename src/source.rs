@@ -24,12 +24,13 @@ use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
-const MAX_API_BODY: u64 = 6 * 1024 * 1024;
+const MAX_API_BODY: u64 = 64 * 1024 * 1024;
 const MAX_PROBE_BODY: u64 = 64 * 1024;
 const MAX_REDIRECTS: usize = 10;
 const RELEASE_PAGE_SIZE: usize = 100;
 const MAX_RELEASE_PAGES: usize = 5;
 const PROBE_CACHE_SECONDS: i64 = 12 * 60 * 60;
+const MIN_PREFERRED_ASSET_SIZE: u64 = 16 * 1024;
 
 static DIRECT_URL_VERSION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[^0-9][0-9]+\.[0-9]+\.[0-9]+(?:$|[./_-])")
@@ -42,6 +43,7 @@ pub use crate::model::SourceKind;
 pub struct AssetCandidate {
     pub name: String,
     pub url: String,
+    pub size: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +82,8 @@ struct GithubRelease {
 struct GithubAsset {
     name: String,
     browser_download_url: String,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -355,6 +359,7 @@ pub(crate) fn resolve_with_asset_preferences(
         candidates: vec![AssetCandidate {
             name,
             url: url.to_string(),
+            size: None,
         }],
     })
 }
@@ -870,6 +875,7 @@ fn resolve_forge(
             candidates: vec![AssetCandidate {
                 name,
                 url: input_url.to_string(),
+                size: None,
             }],
         });
     }
@@ -892,7 +898,7 @@ fn resolve_forge(
     if matches!(request, ReleaseRequest::Latest) {
         selector = selector_for_latest(&tag, project.last().unwrap(), &source)?;
     }
-    filter_and_sort_assets(&mut candidates, &tag, asset_preferences)?;
+    filter_and_sort_assets(&mut candidates, &tag, &app, asset_preferences)?;
     if candidates.is_empty() {
         bail!(
             "no supported release assets found for {}",
@@ -926,6 +932,7 @@ fn gitlab_asset_candidate(link: GitlabLink, forge_origin: &Url) -> AssetCandidat
         } else {
             link.direct_asset_url.unwrap_or(link.url)
         },
+        size: None,
     }
 }
 
@@ -1013,6 +1020,7 @@ fn github_release_parts(release: GithubRelease) -> (String, Vec<AssetCandidate>)
             .map(|asset| AssetCandidate {
                 name: asset.name,
                 url: asset.browser_download_url,
+                size: asset.size,
             })
             .collect(),
     )
@@ -1304,6 +1312,7 @@ fn resolve_github_url(
             candidates: vec![AssetCandidate {
                 name: parts[5..].join("/"),
                 url: url.to_string(),
+                size: None,
             }],
         });
     }
@@ -1450,9 +1459,10 @@ fn resolve_github_at(
         .map(|asset| AssetCandidate {
             name: asset.name,
             url: asset.browser_download_url,
+            size: asset.size,
         })
         .collect::<Vec<_>>();
-    filter_and_sort_assets(&mut candidates, &release.tag_name, preferences.assets)?;
+    filter_and_sort_assets(&mut candidates, &release.tag_name, repo, preferences.assets)?;
     if candidates.is_empty() {
         bail!("no supported release assets found for {owner}/{repo}");
     }
@@ -1836,11 +1846,12 @@ fn url_asset_name(url: &Url, fallback: &str) -> String {
 fn filter_and_sort_assets(
     candidates: &mut Vec<AssetCandidate>,
     tag: &str,
+    app: &str,
     asset_preferences: &AssetPreferences,
 ) -> Result<()> {
     let platform = current_platform()?;
     candidates.retain(|candidate| supported_asset(&candidate.name, tag, platform));
-    sort_assets(candidates, platform, asset_preferences);
+    sort_assets(candidates, platform, app, asset_preferences);
     Ok(())
 }
 
@@ -1849,22 +1860,51 @@ pub(crate) fn rerank_assets(
     asset_preferences: &AssetPreferences,
 ) -> Result<()> {
     let platform = current_platform()?;
-    sort_assets(&mut package.candidates, platform, asset_preferences);
+    sort_assets(
+        &mut package.candidates,
+        platform,
+        &package.app,
+        asset_preferences,
+    );
     Ok(())
 }
 
 fn sort_assets(
     candidates: &mut [AssetCandidate],
     platform: Platform,
+    app: &str,
     asset_preferences: &AssetPreferences,
 ) {
     candidates.sort_by_key(|candidate| {
-        Reverse(asset_score_with_preferences(
-            &candidate.name,
-            platform,
-            asset_preferences,
-        ))
+        (
+            Reverse(
+                asset_score_with_preferences(&candidate.name, platform, asset_preferences)
+                    + app_name_score(&candidate.name, app),
+            ),
+            candidate
+                .size
+                .is_some_and(|size| size < MIN_PREFERRED_ASSET_SIZE),
+            candidate.size.unwrap_or(u64::MAX),
+        )
     });
+}
+
+fn app_name_score(name: &str, app: &str) -> i32 {
+    let name = name.to_ascii_lowercase();
+    let app = app.to_ascii_lowercase();
+    let matches = name.strip_prefix(&app).is_some_and(|suffix| {
+        let suffix =
+            suffix.trim_start_matches(|character: char| !character.is_ascii_alphanumeric());
+        !suffix.is_empty()
+            && PLATFORM_NAME_MARKERS.iter().any(|marker| {
+                suffix.strip_prefix(marker).is_some_and(|rest| {
+                    rest.chars()
+                        .next()
+                        .is_none_or(|character| !character.is_ascii_alphanumeric())
+                })
+            })
+    });
+    i32::from(matches) * 40
 }
 
 const ARCHIVE_SUFFIXES: &[&str] = &[
@@ -1887,6 +1927,9 @@ fn archive_suffix(name: &str) -> Option<&'static str> {
 fn supported_asset(name: &str, tag: &str, platform: Platform) -> bool {
     let name = name.to_ascii_lowercase();
     let tag = tag.to_ascii_lowercase();
+    if marker_match(&name, "android") {
+        return false;
+    }
     #[cfg(all(target_os = "linux", feature = "extras"))]
     if name.ends_with(".appimage") && !matches!(platform, Platform::Linux { .. }) {
         return false;
@@ -2846,6 +2889,11 @@ mod tests {
         assert!(!supported_asset("OpenOffice.AppImage", "latest", platform));
         assert!(supported_asset("tool-linux-amd64", "v1", platform));
         assert!(!supported_asset("tool-windows-amd64.zip", "v1", platform));
+        assert!(!supported_asset(
+            "tool-linux-amd64-android.zip",
+            "v1",
+            platform
+        ));
         assert!(!supported_asset("checksums-linux-amd64", "v1", platform));
         assert!(!supported_asset(
             "tool-darwin-arm64.AppImage",
@@ -3170,12 +3218,18 @@ mod tests {
             .map(|name| AssetCandidate {
                 name: name.into(),
                 url: format!("https://example.com/{name}"),
+                size: None,
             })
             .collect::<Vec<_>>()
         };
 
         let mut gtk = candidates();
-        sort_assets(&mut gtk, platform, &AssetPreferences(vec!["gtk".into()]));
+        sort_assets(
+            &mut gtk,
+            platform,
+            "monopass",
+            &AssetPreferences(vec!["gtk".into()]),
+        );
         assert_eq!(
             gtk.iter()
                 .map(|asset| asset.name.as_str())
@@ -3188,7 +3242,12 @@ mod tests {
         );
 
         let mut qt = candidates();
-        sort_assets(&mut qt, platform, &AssetPreferences(vec!["qt".into()]));
+        sort_assets(
+            &mut qt,
+            platform,
+            "monopass",
+            &AssetPreferences(vec!["qt".into()]),
+        );
         assert_eq!(
             qt.iter()
                 .map(|asset| asset.name.as_str())
@@ -3201,10 +3260,87 @@ mod tests {
         );
 
         let mut unknown = candidates();
-        sort_assets(&mut unknown, platform, &AssetPreferences::default());
+        sort_assets(
+            &mut unknown,
+            platform,
+            "monopass",
+            &AssetPreferences::default(),
+        );
         assert_eq!(unknown[0].name, "monopass-linux-x86_64.tar.gz");
         assert!(supported_asset(&unknown[1].name, "v1", platform));
         assert!(supported_asset(&unknown[2].name, "v1", platform));
+    }
+
+    #[test]
+    fn app_name_match_outweighs_an_unrelated_matching_libc_asset() {
+        let platform = Platform::Linux {
+            arch: HostArch::X86_64,
+            libc: Some(Libc::Glibc),
+        };
+        let mut candidates = [
+            "argument-comment-lint-x86_64-unknown-linux-gnu.tar.gz",
+            "codex-x86_64-unknown-linux-musl.tar.gz",
+            "codex-app-server-package-x86_64-unknown-linux-musl.tar.gz",
+            "codexical-x86_64-unknown-linux-gnu.tar.gz",
+        ]
+        .into_iter()
+        .map(|name| AssetCandidate {
+            name: name.into(),
+            url: format!("https://example.com/{name}"),
+            size: None,
+        })
+        .collect::<Vec<_>>();
+
+        sort_assets(
+            &mut candidates,
+            platform,
+            "codex",
+            &AssetPreferences::default(),
+        );
+
+        assert_eq!(candidates[0].name, "codex-x86_64-unknown-linux-musl.tar.gz");
+    }
+
+    #[test]
+    fn raw_size_breaks_score_ties_and_tiny_assets_remain_fallbacks() {
+        let platform = Platform::Linux {
+            arch: HostArch::X86_64,
+            libc: Some(Libc::Glibc),
+        };
+        let mut candidates = [
+            ("bun-linux-x64-profile.zip", Some(166_064_216)),
+            ("bun-linux-x64.zip", Some(36_697_619)),
+            ("bun-linux-x64-launcher.zip", Some(8_192)),
+        ]
+        .into_iter()
+        .map(|(name, size)| AssetCandidate {
+            name: name.into(),
+            url: format!("https://example.com/{name}"),
+            size,
+        })
+        .collect::<Vec<_>>();
+
+        sort_assets(
+            &mut candidates,
+            platform,
+            "bun",
+            &AssetPreferences::default(),
+        );
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "bun-linux-x64.zip",
+                "bun-linux-x64-profile.zip",
+                "bun-linux-x64-launcher.zip",
+            ]
+        );
+
+        candidates.retain(|candidate| candidate.size == Some(8_192));
+        assert_eq!(candidates[0].name, "bun-linux-x64-launcher.zip");
     }
 
     #[test]
@@ -3635,6 +3771,7 @@ mod tests {
         let candidate = AssetCandidate {
             name: "tool".into(),
             url: format!("{origin}/asset"),
+            size: None,
         };
         let mut response = asset_response(&client().unwrap(), &package, &candidate).unwrap();
         let mut body = String::new();

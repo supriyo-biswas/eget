@@ -264,6 +264,26 @@ $ which go
 /home/me/my-project/.eget/bin/go
 ```
 
+## Additional binary variants
+
+On Linux, the `extras` build supports desktop integration and extraction of
+AppImages without libfuse. You can install it in a similar way as the normal
+build:
+
+```sh
+curl -sSLfo eget \
+  "https://github.com/supriyo-biswas/eget/releases/latest/download/eget-$(uname -sm | tr 'A-Z ' 'a-z-')"
+
+chmod +x eget
+mv eget ~/.local/bin
+```
+
+Once installed, you can do things like:
+
+```sh
+eget ivan-hc/vlc-appimage
+```
+
 ## More information
 
 Run `eget --help` or `eget <command> --help` for the complete command-line

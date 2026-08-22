@@ -121,7 +121,8 @@ This same channel-aware lookup (fetch-latest-and-compare, or forge-appropriate p
 ## Asset selection
 
 Asset names are matched case-insensitively. Reject signatures, checksums, and
-source archives. A candidate must contain a recognized host OS marker and
+source archives. Android-marked assets are not eligible on the supported Linux
+and macOS hosts. A candidate must contain a recognized host OS marker and
 architecture marker at a non-alphanumeric boundary, and must end in a
 supported archive suffix, a recognized platform suffix, the release tag, or
 no extension. When the Linux `extras` feature is enabled, format-specific
@@ -134,6 +135,10 @@ or more non-alphanumeric separators between them (for example,
 `linux-amd64`, `linux.x64`, `linux_x86_64`, or `amd64_linux`); the pair must
 end the filename. Rank the remaining candidates as follows:
 
+* Add 40 points when the asset name starts with the repository application name
+  and the next delimited word is a recognized OS or architecture marker. This
+  makes the primary application artifact outrank unrelated tools and secondary
+  application-prefixed artifacts published in the same release.
 * Add 10 points for a supported archive suffix.
 * On Linux, add 5 points for a `static` marker.
 * When the host libc is known, add 20 points for the matching libc (`glibc`/`gnu` or `musl`) and subtract 1 point for the incompatible libc. An unmarked build therefore ranks above an explicitly incompatible one.
@@ -141,6 +146,11 @@ end the filename. Rank the remaining candidates as follows:
 * For asset-name words matched at non-alphanumeric boundaries, add 1 point to the detected `gtk` or `qt` marker and subtract 1 point from the other marker. With no detected toolkit, subtract 1 point from either marker. Thus otherwise-equivalent candidates rank as matching toolkit, unmarked, then non-matching toolkit, while every variant remains eligible as a fallback.
 * Use the package's persisted `asset_preferences` during updates and reinstalls. For a migrated package whose preference is still null, detect it for the next attempted installation and persist it only after that installation succeeds.
 * Linux-specific libc and static markers do not affect macOS ranking.
+* Within an equal score, rank assets by their raw release-metadata byte size,
+  smallest first. Assets with a known size below 16 KiB rank after other tied
+  candidates but remain eligible as fallbacks. An unknown size sorts after known
+  non-tiny sizes and before known sub-16-KiB sizes; equal and unknown sizes retain
+  their forge-provided order.
 
 Candidates are attempted in descending score order until one yields at least
 one compatible executable. If all candidates fail, installation reports the
