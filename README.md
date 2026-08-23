@@ -267,12 +267,12 @@ $ which go
 ## Additional binary variants
 
 On Linux, the `extras` build supports desktop integration and extraction of
-AppImages without libfuse. You can install it in a similar way as the normal
-build:
+AppImages without libfuse. Appimage support is currently experimental. You can
+install it in a similar way as the normal build:
 
 ```sh
 curl -sSLfo eget \
-  "https://github.com/supriyo-biswas/eget/releases/latest/download/eget-$(uname -sm | tr 'A-Z ' 'a-z-')"
+  "https://github.com/supriyo-biswas/eget/releases/latest/download/eget-$(uname -sm | tr 'A-Z ' 'a-z-')-extras"
 
 chmod +x eget
 mv eget ~/.local/bin

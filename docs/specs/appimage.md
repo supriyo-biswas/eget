@@ -23,13 +23,15 @@ Use in-process, read-only readers:
   Disable its default features and enable only `gzip` and `zstd`, the codecs
   present in the [investigated AppImages](../decisions/appimage-extraction.md#investigation). This avoids its XZ, LZ4, LZO, and
   Rayon dependencies while sharing eget's existing `flate2` and `zstd` graph.
-- [`dwarfs`](https://docs.rs/dwarfs/0.2.1/dwarfs/) for DwarFS. Disable its
+- A [vendored `dwarfs` 0.2.1](../../vendor/dwarfs/) for DwarFS. Disable its
   default features and enable only `zstd`, which shares eget's existing
-  `zstd-safe`/`zstd-sys`; construct it at the computed image offset. Version 0.2.1
-  understands DwarFS filesystem versions 2.3 through 2.5, including the 2.5
-  images documented in the [investigation](../decisions/appimage-extraction.md#investigation). Validate against real newest-publisher images because
-  the crate only guarantees compatibility with the upstream versions named in
-  its own documentation.
+  `zstd-safe`/`zstd-sys`; construct it at the computed image offset. The
+  vendored copy includes the upstream sparse-file reader patch described in
+  its [`EGET_PATCH.md`](../../vendor/dwarfs/EGET_PATCH.md). It understands
+  DwarFS filesystem versions 2.3 through 2.5, including the 2.5 images
+  documented in the [investigation](../decisions/appimage-extraction.md#investigation). Validate against real newest-publisher images because the
+  crate only guarantees compatibility with the upstream versions named in its
+  own documentation.
 
 Do not invoke filesystem utilities from `src/archive.rs`. External utilities
 make installation host-dependent and bypass the archive safety checks that

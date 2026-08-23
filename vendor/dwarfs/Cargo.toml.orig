@@ -1,0 +1,42 @@
+[package]
+name = "dwarfs"
+version = "0.2.1"
+edition = "2024"
+description = "A library for reading DwarFS archives (aka. DwarFS images)"
+license = "MIT OR Apache-2.0"
+keywords = ["dwarfs", "archive", "compression"]
+categories = ["compression", "filesystem"]
+repository = "https://github.com/oxalica/dwarfs-rs"
+
+[features]
+default = ["zstd", "log"]
+
+# Compression algorithms support.
+zstd = ["dep:zstd-safe"]
+lzma = ["dep:liblzma"]
+lz4 = ["dep:lz4"]
+
+# Extra functionalities.
+log = ["dep:log", "dep:measure_time"]
+serialize = ["dep:indexmap"]
+
+[dependencies]
+bstr = { version = "1.12.0", features = ["serde"] }
+indexmap = { version = "2.9.0", optional = true }
+log = { version = "0.4.27", optional = true }
+lru = "0.14.0"
+lz4 = { version = "1.28.1", optional = true }
+measure_time = { version = "0.9.0", optional = true }
+positioned-io = { version = "0.3.4", default-features = false }
+serde = { version = "1.0.219", features = ["derive"] }
+sha2 = "0.10.9"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+liblzma = { version = "0.4.1", optional = true }
+zerocopy = { version = "0.8.25", features = ["derive", "std"] }
+zstd-safe = { version = "7.2.4", optional = true, default-features = false }
+
+[lints.clippy]
+dbg-macro = "warn"
+todo = "warn"
+print-stdout = "warn"
+print-stderr = "warn"

@@ -39,7 +39,7 @@ zstd = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 backhand = { version = "0.25.1", optional = true, default-features = false, features = ["gzip", "zstd"] }
-dwarfs = { version = "0.2.1", optional = true, default-features = false, features = ["zstd"] }
+dwarfs = { path = "vendor/dwarfs", optional = true, default-features = false, features = ["zstd"] }
 
 [dev-dependencies]
 hex = "0.4"
